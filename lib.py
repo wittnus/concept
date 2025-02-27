@@ -20,12 +20,13 @@ def reject(U: Array, v: Array) -> Array:
 class DetNode:
     embedding: Array  # shape: (D, C)
 
-    def create(D: int, C: int, key: PRNGKey) -> "DetNode":
+    @classmethod
+    def create(cls, D: int, C: int, key: PRNGKey) -> "DetNode":
         embedding = jax.random.normal(key, (D, C))
         M = embedding @ embedding.T
         invroot = jnp.linalg.inv(jnp.linalg.cholesky(M))
         embedding = invroot @ embedding
-        return DetNode(embedding=embedding)
+        return cls(embedding=embedding)
 
     @property
     def D(self) -> int:
@@ -74,13 +75,38 @@ class DetNode:
 
 @chex.dataclass
 class Model:
-    det_node: DetNode
+    dnode: DetNode
     means: Array  # shape: (C, N)
+    normalizer: Array = None
+
+    @classmethod
+    def create_with_dnode(cls, dnode: DetNode, N: int, key: PRNGKey) -> "Model":
+        means = jax.random.normal(key, (dnode.C, N)) * 5.
+        return cls(dnode=dnode, means=means).normalize()
+
+    def normalize(self) -> "Model":
+        embedding = self.dnode.embedding
+        means = self.means
+        N = self.N
+        probs = jnp.einsum("...ij,...ij->...j", embedding, embedding)
+        outers = jnp.einsum("...ij,...ik->...ijk", means, means)
+        expected_outer = jnp.einsum("...i,...ijk->...jk", probs, outers)
+        total_variance = jnp.eye(N) + expected_outer
+        invroot = jnp.linalg.inv(jnp.linalg.cholesky(total_variance))
+        return Model(dnode=self.dnode, means=means, normalizer=invroot)
+
+        
 
     @property
     def N(self) -> int:
         return self.means.shape[1]
-
+    
+    @jax.jit
     def sample(self, key: PRNGKey) -> Tuple[Array, Array]:
-        choice, prob = self.det_node.sample(key)
-        return jnp.sum(self.means, axis=0, where=choice), prob
+        key1, key2 = jax.random.split(key)
+        choice, prob = self.dnode.sample(key1)
+        center = jnp.sum(self.means, axis=0, where=choice[...,None])
+        noise = jax.random.normal(key2, (self.N,))
+        sample = center + noise
+        sample = self.normalizer @ sample
+        return sample, prob

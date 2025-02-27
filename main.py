@@ -1,4 +1,4 @@
-from lib import DetNode
+from lib import DetNode, Model
 import jax
 from jax import numpy as jnp
 from jax.nn import one_hot
@@ -8,6 +8,12 @@ from typing import Tuple
 from jax.random import PRNGKey
 from itertools import combinations
 from tqdm import tqdm, trange
+
+import matplotlib
+from matplotlib import pyplot as plt
+
+matplotlib.use("TkAgg")
+
 
 
 def all_possible_choices(D, C):  # D: ways of choosing D items from C
@@ -32,6 +38,7 @@ def main():
     init_key = PRNGKey(0)
     D = 2
     C = 4
+    N = 2
     dnode = DetNode.create(D, C, init_key)
     #manual_embedding = jnp.array([one_hot(0,D), one_hot(0,D), one_hot(1,D), one_hot(1,D)]).T
     #dnode = DetNode(embedding=manual_embedding)
@@ -53,13 +60,24 @@ def main():
     print(f"sum of probs: {sum(overall_probs.values())}")
 
     counts = dict()
-    num_samples = 10000
+    num_samples = 1000
     for subkey in tqdm(jax.random.split(sample_key, num_samples)):
         sample, prob = dnode.sample(subkey)
         choice = choice_array_as_tuple(sample)
         counts[choice] = counts.get(choice, 0) + 1
     for choice in all_choices:
         print(f"{choice_as_array(choice, C)}: {counts.get(choice, 0) / num_samples}")
+
+    model_init_key = PRNGKey(4)
+    model = Model.create_with_dnode(dnode, N, model_init_key)
+    model_sample_key = PRNGKey(5)
+    samples = list()
+    for subkey in tqdm(jax.random.split(model_sample_key, 1000)):
+        sample, prob = model.sample(subkey)
+        samples.append(sample)
+    samples = np.array(samples)
+    plt.scatter(samples[:, 0], samples[:, 1])
+    plt.show()
 
 
 if __name__ == "__main__":
