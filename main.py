@@ -7,6 +7,7 @@ from chex import Array
 from typing import Tuple
 from jax.random import PRNGKey
 from itertools import combinations
+from functools import partial
 from tqdm import tqdm, trange
 from jax.tree_util import tree_map
 
@@ -43,8 +44,7 @@ def sample_model(model: Model, key: PRNGKey, count: int) -> Tuple[Array, Array]:
     return np.array(samples)
 
 def check_cond_lprob(dnode: DetNode, key: PRNGKey) -> None:
-    sample, prob = dnode.sample(key)
-    cond_lprob = jnp.log(prob)
+    sample, cond_lprob = dnode.sample(key)
     overall_lprob = dnode.log_prob(jnp.log(sample.astype(jnp.float32)))
     print(f"cond_lprob: {cond_lprob}, overall_lprob: {overall_lprob}")
     assert cond_lprob <= overall_lprob
@@ -74,10 +74,11 @@ def sample_model(model: Model, key: PRNGKey, count: int) -> Array:
         samples.append(sample)
     return np.array(samples)
 
-def visualize_model_samples(model: Model, key: PRNGKey) -> None:
+def visualize_model_samples(model: Model, key: PRNGKey, show: bool=True) -> None:
     samples = np.array(sample_model(model, key, 1000))
     plt.scatter(samples[:, 0], samples[:, 1])
-    plt.show()
+    if show:
+        plt.show()
 
 def compare_models_at_samples_from1(model1: Model, model2: Model, key: PRNGKey, count: int) -> None:
     samples = sample_model(model1, key, count)
@@ -101,19 +102,54 @@ def make_model(D, C, N, key):
     model = Model.create_with_dnode(dnode, N, key2)
     return model
 
+@jax.jit
 def model_nll(model, data):
     return -model.exact_log_density(data).mean()
 
+@jax.jit
+def model_entropy(model, data):
+    return -model.exact_entropy(data).mean()
+
+@jax.jit
+def model_exact_stochastic_entropy(model, data, key):
+    neg_entropy, counts = model.exact_stochastic_entropy(data, key)
+    return -neg_entropy.mean(), counts.mean(axis=0)
+
+@jax.jit
+def model_stochastic_entropy(model, data, key):
+    neg_entropy, counts = model.stochastic_entropy(data, key)
+    return -neg_entropy.mean(), counts.mean(axis=0)
+    return -model.stochastic_entropy(data, key).mean()
+
 def fit_model(model, data):
     @jax.jit
-    @jax.value_and_grad
-    def loss_grad(model, data):
-        return model_nll(model, data)
-    for i in range(10000):
-        loss, grad = loss_grad(model, data)
-        if i % 100 == 0:
-            print(f"loss: {loss}")
-        model = tree_map(lambda p, g: p - 1e-2 * g, model, grad).renormalize_dnode()
+    @partial(jax.value_and_grad, has_aux=True)
+    def loss_grad(model, data, key):
+        return model_stochastic_entropy(model, data, key)
+        return model_entropy(model, data), 0
+        return model_nll(model, data), 0
+    P = 100
+    total_loss = 0.
+    #total_exact_loss = 0.
+    #total_exact_entropy = 0.
+    for i, subkey in enumerate(jax.random.split(PRNGKey(0), 3000)):
+        (loss, counts), grad = loss_grad(model, data, subkey)
+        #print(counts)
+        #exact_loss = jax.jit(model_nll)(model, data)
+        #exact_entropy = jax.jit(model_entropy)(model, data)
+        total_loss += loss
+        #total_exact_loss += exact_loss
+        #total_exact_entropy += exact_entropy
+        if i % P == P-1:
+            exact_loss = model_nll(model, data)
+            exact_entropy = model_entropy(model, data)
+            print(f"loss: {total_loss/P:.3f} (ent: {exact_entropy:.3f} exact: {exact_loss:.3f})")
+            #_, counts = model_stochastic_entropy(model, data, subkey)
+            #print(counts)
+            total_loss = 0.
+            #total_exact_loss = 0.
+            #total_exact_entropy = 0.
+        model = tree_map(lambda p, g: p - 3e-2 * g, model, grad).renormalize_dnode()
     return model
 
 
@@ -130,12 +166,13 @@ def main():
     compare_probs(dnode, PRNGKey(2))
 
     model1 = Model.create_with_dnode(dnode, N, PRNGKey(4))
-    #visualize_model_samples(model1, PRNGKey(5))
-    model1 = make_model(D, C, N, PRNGKey(4))
+    visualize_model_samples(model1, PRNGKey(5))
+    #model1 = make_model(D, C, N, PRNGKey(4))
     model2 = make_model(D+1, C+2, N, PRNGKey(6))
-    compare_models_at_samples_from1(model1, model2, PRNGKey(6), 10)
+    compare_models_at_samples_from1(model1, model2, PRNGKey(8), 10)
 
-    data_from_model1 = sample_model(model1, PRNGKey(7), 1000)
+    data_from_model1 = sample_model(model1, PRNGKey(7), 10)
+    #model2 = fit_model(model1, data_from_model1)
     model2 = fit_model(model2, data_from_model1)
     nll1 = model_nll(model1, data_from_model1)
     nll2 = model_nll(model2, data_from_model1)
@@ -144,6 +181,8 @@ def main():
 
     KL = estimate_KL(model1, model2, PRNGKey(9), 1000)
     print(f"Estimated KL: {KL}")
+    visualize_model_samples(model1, PRNGKey(10), show=False)
+    visualize_model_samples(model2, PRNGKey(10), show=True)
 
 
 
