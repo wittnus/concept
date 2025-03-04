@@ -1,4 +1,5 @@
 from lib import DetNode, Model
+from stats import test_multinomial_same, test_multinomial_exact
 import jax
 from jax import numpy as jnp
 from jax.nn import one_hot
@@ -15,6 +16,39 @@ import matplotlib
 from matplotlib import pyplot as plt
 
 matplotlib.use("TkAgg")
+
+
+def test_sampling_at_x(model: Model, key: PRNGKey, x: Array) -> None:
+    x_unnorm = x @ model.unnormalizer().T
+    all_choices = model.all_possible_choices()
+    ground_truth_log_densities = model.all_choice_log_densities(x_unnorm)
+    assert len(ground_truth_log_densities) == len(all_choices)
+    ground_truth_probs = jax.nn.softmax(ground_truth_log_densities)
+    #print(f"ground_truth_probs: {ground_truth_probs}")
+    key1, key2 = jax.random.split(key)
+    keys = jax.random.split(key1, 10000)
+    exact_samples = jax.vmap(model.exact_cond_sample, in_axes=(None, 0))(x, keys)
+    exact_counts = (all_choices == exact_samples[:, None, :]).all(axis=-1).sum(axis=0)
+    exact_score = test_multinomial_exact(ground_truth_probs, exact_counts)
+    #print(f"counts: {exact_counts}")
+    gibbs_samples = exact_samples
+    gibbs_samples = jax.vmap(model.greedy_sample_cond, in_axes=(None, 0))(x, keys)
+    init_counts = (all_choices == gibbs_samples[:, None, :]).all(axis=-1).sum(axis=0)
+    init_score = test_multinomial_exact(ground_truth_probs, init_counts)
+    for i in range(30):
+        key2, key3 = jax.random.split(key2)
+        gibbs_keys = jax.random.split(key3, 10000)
+        gibbs_samples = jax.vmap(model.gibbs_resample_cond, in_axes=(0, None, 0))(gibbs_samples, x_unnorm, gibbs_keys)
+        #gibbs_samples = jax.vmap(model.adjacency_gibbs_cond, in_axes=(0, None, 0))(gibbs_samples, x_unnorm, gibbs_keys)
+
+    gibbs_counts = (all_choices == gibbs_samples[:, None, :]).all(axis=-1).sum(axis=0)
+    #print(f"gibbs_counts: {gibbs_counts}")
+    gibbs_score = test_multinomial_exact(ground_truth_probs, gibbs_counts)
+    mcmc_samples = model.monte_carlo_sample_cond(jnp.broadcast_to(x, (10000, *x.shape)), key2)
+    mcmc_counts = (all_choices == mcmc_samples[:, None, :]).all(axis=-1).sum(axis=0)
+    mcmc_score = test_multinomial_exact(ground_truth_probs, mcmc_counts)
+    print(f"exact: {exact_score}, init: {init_score}, gibbs: {gibbs_score}, mcmc: {mcmc_score}")
+    #print(f"done")
 
 
 
@@ -111,13 +145,17 @@ def model_entropy(model, data):
     return -model.exact_entropy(data).mean()
 
 @jax.jit
+def model_entropy_at(model, data, choices):
+    return -model.conditional_log_density(data, choices).mean()
+
+@jax.jit
 def model_exact_stochastic_entropy(model, data, key):
     neg_entropy, counts = model.exact_stochastic_entropy(data, key)
     return -neg_entropy.mean(), counts.mean(axis=0)
 
 @jax.jit
 def model_stochastic_entropy(model, data, key):
-    neg_entropy, counts = model.stochastic_entropy(data, key)
+    neg_entropy, counts = model.monte_carlo_entropy(data, key)
     return -neg_entropy.mean(), counts.mean(axis=0)
     return -model.stochastic_entropy(data, key).mean()
 
@@ -128,18 +166,32 @@ def fit_model(model, data):
         return model_stochastic_entropy(model, data, key)
         return model_entropy(model, data), 0
         return model_nll(model, data), 0
-    P = 100
+    @jax.jit
+    @jax.value_and_grad
+    def cond_entropy(model, data, choices):
+        return model_entropy_at(model, data, choices)
+    P = 30
     total_loss = 0.
     #total_exact_loss = 0.
     #total_exact_entropy = 0.
-    for i, subkey in enumerate(jax.random.split(PRNGKey(0), 3000)):
-        (loss, counts), grad = loss_grad(model, data, subkey)
+    choices = model.monte_carlo_sample_cond(data, PRNGKey(0))
+    opt_state = model.OptState.init(model)
+    for i, subkey in enumerate(jax.random.split(PRNGKey(0), 300)):
+        #choices = model.monte_carlo_resample_cond(data, choices, subkey, N=3)
+        key1, key2 = jax.random.split(subkey)
+        #choices = model.monte_carlo_sample_cond(data, key1)
+        #choices = model.monte_carlo_resample_cond(data, choices, key2, N=100)
+        choices = jax.vmap(model.exact_cond_sample)(data, jax.random.split(key1, data.shape[0]))
+        loss, grad = cond_entropy(model, data, choices)
+        #(loss, counts), grad = loss_grad(model, data, subkey)
         #print(counts)
         #exact_loss = jax.jit(model_nll)(model, data)
         #exact_entropy = jax.jit(model_entropy)(model, data)
         total_loss += loss
         #total_exact_loss += exact_loss
         #total_exact_entropy += exact_entropy
+        #if i % 10 == 9:
+        #    choices = model.monte_carlo_sample_cond(data, subkey)
         if i % P == P-1:
             exact_loss = model_nll(model, data)
             exact_entropy = model_entropy(model, data)
@@ -149,35 +201,53 @@ def fit_model(model, data):
             total_loss = 0.
             #total_exact_loss = 0.
             #total_exact_entropy = 0.
-        model = tree_map(lambda p, g: p - 3e-2 * g, model, grad).renormalize_dnode()
+        #opt_state = model.observe(opt_state, data, choices)
+        #model = model.apply(opt_state)
+        model = model.lstsq_observe(data, choices)
+        #dnode = tree_map(lambda p, g: p - 1e-1 * g, model.dnode, grad.dnode).renormalize()
+        dnode = model.dnode.observe(choices)
+        model = model.replace(dnode=dnode)
+        #model = tree_map(lambda p, g: p - 3e-2 * g, model, grad).renormalize_dnode()
     return model
 
 
 def main():
     init_key = PRNGKey(1)
     D = 2
-    C = 4
-    N = 2
+    C = D*2
+    N = 8
     dnode = DetNode.create(D, C, init_key)
     manual_embedding = jnp.array([one_hot(0,D), one_hot(0,D), one_hot(1,D), one_hot(1,D)]).T
+    manual_embedding = jnp.array(
+            sum([[one_hot(i, D)] * (C//D) for i in range(D)], [])
+            ).T
     dnode = DetNode(embedding=manual_embedding)
 
     check_cond_lprob(dnode, PRNGKey(3))
     compare_probs(dnode, PRNGKey(2))
 
     model1 = Model.create_with_dnode(dnode, N, PRNGKey(4))
+    model2 = make_model(D+2, C+4, N, PRNGKey(6))
+    test_samples = sample_model(model1, PRNGKey(5), 3)
+    print("testing in distribution sampling...")
+    #for test_sample in test_samples:
+    #    test_sampling_at_x(model1, PRNGKey(5), test_sample)
+    print("testing out of distribution sampling...")
+    #for test_sample in test_samples:
+    #    test_sampling_at_x(model2, PRNGKey(5), test_sample)
+    print("done testing sampling...")
     visualize_model_samples(model1, PRNGKey(5))
     #model1 = make_model(D, C, N, PRNGKey(4))
-    model2 = make_model(D+1, C+2, N, PRNGKey(6))
-    compare_models_at_samples_from1(model1, model2, PRNGKey(8), 10)
+    #compare_models_at_samples_from1(model1, model2, PRNGKey(8), 10)
 
-    data_from_model1 = sample_model(model1, PRNGKey(7), 10)
+    data_from_model1 = sample_model(model1, PRNGKey(7), 1000)
+    print(f"ground truth entropy: {-model1.exact_entropy(data_from_model1).mean()}")
     #model2 = fit_model(model1, data_from_model1)
     model2 = fit_model(model2, data_from_model1)
     nll1 = model_nll(model1, data_from_model1)
     nll2 = model_nll(model2, data_from_model1)
     print(f"nll1: {nll1}, nll2: {nll2}")
-    compare_models_at_samples_from1(model1, model2, PRNGKey(8), 10)
+    #compare_models_at_samples_from1(model1, model2, PRNGKey(8), 10)
 
     KL = estimate_KL(model1, model2, PRNGKey(9), 1000)
     print(f"Estimated KL: {KL}")

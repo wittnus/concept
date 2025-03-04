@@ -108,6 +108,19 @@ class DetNode:
         #return active & ~jax.nn.one_hot(choice, self.C, axis=-1, dtype=jnp.bool)
         return active.at[choice].set(False)
 
+    def observe(self, choices: Array) -> "DetNode":
+        active_embeddings = jnp.where(choices[..., None, :], self.embedding, 0.0)
+        Ms = jnp.einsum("...ij,...kj->...ik", active_embeddings, active_embeddings)
+        @jax.vmap
+        def invroot(M):
+            return jnp.linalg.inv(jnp.real(jax.scipy.linalg.sqrtm(M + 1e-3*jnp.eye(self.D))))
+        Minvroots = invroot(Ms)
+        observed_embeddings = jnp.einsum("...ij,...jk->...ik", Minvroots, active_embeddings)
+        total_embedding = jnp.sum(observed_embeddings, axis=-3)
+        return DetNode(embedding=total_embedding).renormalize()
+
+
+
 
 def all_possible_choice_arrays(dnode: DetNode) -> Array:
     D = dnode.D
@@ -123,6 +136,17 @@ def unit_gaussian_log_density(x: Array) -> Array:
     """include quadratic term as well as normalization"""
     return -0.5 * jnp.sum(x ** 2, axis=-1) - 0.5 * x.shape[-1] * jnp.log(2 * jnp.pi)
 
+def all_choice_additions(choice: Array) -> Array:
+    return jnp.eye(choice.shape[-1], dtype=jnp.bool) | choice[..., None, :]
+
+def all_adjacencies(choice: Array) -> Array:
+    to_add = jnp.eye(choice.shape[-1], dtype=jnp.bool)
+    to_remove = jnp.eye(choice.shape[-1], dtype=jnp.bool)
+    with_removed = ~to_remove[..., :, None, :] & choice[..., None, None, :]
+    with_added = to_add[..., None, :, :] | with_removed
+    return with_added
+    
+
 
 @chex.dataclass
 class Model:
@@ -131,7 +155,7 @@ class Model:
 
     @classmethod
     def create_with_dnode(cls, dnode: DetNode, N: int, key: PRNGKey) -> "Model":
-        means = jax.random.normal(key, (dnode.C, N)) * 5.
+        means = jax.random.normal(key, (dnode.C, N)) * 3.
         return cls(dnode=dnode, means=means)
 
     def renormalize_dnode(self) -> "Model":
@@ -155,15 +179,18 @@ class Model:
     def unnormalizer(self) -> Array:
         tvar_logdet = jnp.linalg.slogdet(self.total_variance())[1]
         factor = jnp.exp(0.5 * tvar_logdet / self.N)
-        return jnp.eye(self.N) * factor
-        #return jnp.linalg.cholesky(self.total_variance())
-        #return jnp.real(jax.scipy.linalg.sqrtm(self.total_variance()))
+        return jnp.eye(self.N) #* factor
+        return jnp.linalg.cholesky(self.total_variance())
+        return jnp.real(jax.scipy.linalg.sqrtm(self.total_variance()))
 
     def normalizer(self) -> Array:
         return jnp.linalg.inv(self.unnormalizer())
 
     def decode_mean(self, choice: Array) -> Array:
         return jnp.sum(self.means, axis=-2, where=choice[..., None])
+
+    def all_possible_choices(self) -> Array:
+        return all_possible_choice_arrays(self.dnode)
 
     @property
     def N(self) -> int:
@@ -198,8 +225,14 @@ class Model:
         return unit_gaussian_log_density(diff) + choice_log_prob
 
     def all_choice_log_densities(self, x) -> Array:
+        """for internal use - does not normalize"""
         all_choices = all_possible_choice_arrays(self.dnode)
         return jax.vmap(self.choice_log_density, in_axes=(0, None), out_axes=-1)(all_choices, x)
+
+    def exact_all_choice_log_densities(self, x) -> Array:
+        """for external use"""
+        x = x @ self.unnormalizer().T
+        return self.all_choice_log_densities(x)
 
     def exact_log_density(self, x: Array) -> Array:
         #x = x @ jax.lax.stop_gradient(jax.lax.stop_gradient(self).unnormalizer().T)
@@ -210,6 +243,12 @@ class Model:
         unnorm_logdet = jnp.linalg.slogdet(self.unnormalizer())[1]
         return marginal_density + unnorm_logdet
 
+    def conditional_log_density(self, x: Array, choice: Array) -> Array:
+        x = x @ self.unnormalizer().T
+        choice_log_density = jax.vmap(self.choice_log_density)(choice, x)
+        unnorm_logdet = jnp.linalg.slogdet(self.unnormalizer())[1]
+        return choice_log_density + unnorm_logdet
+
     def exact_entropy(self, x: Array) -> Array:
         x = x @ self.unnormalizer().T
         lprobs = self.all_choice_log_densities(x)
@@ -217,6 +256,14 @@ class Model:
         marginal_entropy = jnp.sum(probs * lprobs, axis=-1)
         unnorm_logdet = jnp.linalg.slogdet(self.unnormalizer())[1]
         return marginal_entropy + unnorm_logdet
+
+    @jax.jit
+    def exact_cond_sample(self, x: Array, key: PRNGKey) -> Array:
+        x = x @ self.unnormalizer().T
+        all_choices = all_possible_choice_arrays(self.dnode)
+        lprobs = self.all_choice_log_densities(x)
+        choices = jax.random.categorical(key, lprobs, axis=-1)
+        return all_choices[choices]
 
     def exact_stochastic_entropy(self, x: Array, key: PRNGKey) -> Array:
         x = x @ self.unnormalizer().T
@@ -229,37 +276,68 @@ class Model:
         unnorm_logdet = jnp.linalg.slogdet(self.unnormalizer())[1]
         return choice_log_densities + unnorm_logdet, choice_counts
 
+    @jax.jit
+    def monte_carlo_resample_cond(self, x: Array, choices: Array, key: PRNGKey, N: int=30) -> Array:
+        x = x @ self.unnormalizer().T
+        def step(i, state):
+            key, choices = state
+            key, new_key = jax.random.split(key)
+            new_choices = jax.vmap(self.gibbs_resample_cond)(choices, x, jax.random.split(key, x.shape[0]))
+            return new_key, new_choices
+        key, choices = jax.lax.fori_loop(0, N, step, (key, choices))
+        return choices
+
+    @jax.jit
+    def monte_carlo_sample_cond(self, x: Array, key: PRNGKey) -> Array:
+        x_unnorm = x @ self.unnormalizer().T
+        init_key, gibbs_key = jax.random.split(key)
+        choices = jax.vmap(self.greedy_sample_cond)(x_unnorm, jax.random.split(init_key, x.shape[0]))
+        choices = self.monte_carlo_resample_cond(x, choices, gibbs_key)
+        return choices
+
+    def monte_carlo_entropy(self, x: Array, key: PRNGKey) -> Array:
+        choices = self.monte_carlo_sample_cond(x, key)
+        x = x @ self.unnormalizer().T
+        choice_log_densities = jax.vmap(self.choice_log_density)(choices, x)
+        logdet_term = jnp.linalg.slogdet(self.unnormalizer())[1]
+        return choice_log_densities + logdet_term, choices.astype(jnp.float32)
+
 
 
     def stochastic_entropy(self, x: Array, key: PRNGKey) -> Array:
+        #init_choices = self.exact_cond_sample(x, key)
         x = x @ self.unnormalizer().T
         logdet_term = jnp.linalg.slogdet(self.unnormalizer())[1]
         init_key, gibbs_key = jax.random.split(key)
         choices = jax.vmap(self.greedy_sample_cond)(x, jax.random.split(init_key, x.shape[0]))
+        #choices = init_choices
         #jax.debug.print("choices: {}", choices)
         choice_log_densities = jax.vmap(self.choice_log_density)(choices, x)
         mass = 1
         choice_counts = choices.astype(jnp.float32)
-        for i in range(1):
+        for i in range(30):
             gibbs_key, subkey = jax.random.split(gibbs_key)
             choices = jax.vmap(self.gibbs_resample_cond)(choices, x, jax.random.split(subkey, x.shape[0]))
+            #choices = jax.vmap(self.adjacency_gibbs_cond)(choices, x, jax.random.split(subkey, x.shape[0]))
             #print(jnp.mean(choices, axis=0))
             new_log_densities = jax.vmap(self.choice_log_density)(choices, x)
-            choice_log_densities += new_log_densities
-            #choice_log_densities += jax.vmap(self.choice_log_density)(choices, x)
-            #jax.debug.print("ld: {:.3f}",new_log_densities.mean())
+            choice_log_densities = new_log_densities
             choice_counts = choices.astype(jnp.float32)
             mass = 1
         #jax.debug.print("{}", (jnp.sum(choices.astype(jnp.int32), axis=-1)==self.dnode.D).all())
         return choice_log_densities / mass + logdet_term, choice_counts / mass
 
     def greedy_sample_one_cond(self, choice: Array, x: Array, key: PRNGKey) -> Array:
-        current_mean = self.decode_mean(choice)
-        new_means = current_mean + self.means
-        diffs = x[...,None,:] - new_means
-        cond_lprobs = unit_gaussian_log_density(diffs)
+        #current_mean = self.decode_mean(choice)
+        #new_means = current_mean + self.means
+        #diffs = x[...,None,:] - new_means
+        #cond_lprobs = unit_gaussian_log_density(diffs)
+        new_choices = all_choice_additions(choice)
+        new_log_densities = jax.vmap(self.choice_log_density, in_axes=(-2, None), out_axes=-1)(new_choices, x)
+        new_log_densities = jnp.where(choice, -jnp.inf, new_log_densities)
+        new_index = jax.random.categorical(key, new_log_densities, axis=-1)
         #jax.debug.print("cond_lprobs: {}", cond_lprobs)
-        new_index, _ = self.dnode.condition(cond_lprobs).sample_one(choice, key)
+        #new_index, _ = self.dnode.condition(cond_lprobs).sample_one(choice, key)
         #jax.debug.print("new_index: {}", new_index)
         #new_index, _ = self.dnode.sample_one_cond(choice, cond_lprobs, key)
         new_choice = choice.at[new_index].set(True)
@@ -284,16 +362,75 @@ class Model:
 
     def gibbs_resample_cond(self, choice: Array, x: Array, key: PRNGKey) -> Array:
         key1, key2 = jax.random.split(key)
-        #deactivate = jax.random.categorical(key1, jnp.log(choice.astype(jnp.float32)), axis=-1)
-        #choice = choice.at[deactivate].set(False)
+        deactivate = jax.random.categorical(key1, jnp.log(choice.astype(jnp.float32)), axis=-1)
+        choice = choice.at[deactivate].set(False)
         #choice = self.dnode.condition(jnp.log(choice.astype(jnp.float32))).unsample_one(choice, key1)
         #jax.debug.print("b {}", jnp.sum(choice.astype(jnp.int32), axis=-1)==self.dnode.D)
         #choice = self.dnode.unsample_one(choice, key1)
         #jax.debug.print("a1 {}", jnp.sum(choice.astype(jnp.int32), axis=-1)==self.dnode.D-1)
         #jax.debug.print("before: {}", choice)
-        choice = self.greedy_remove_one_cond(choice, x, key1)
+        #choice = self.greedy_remove_one_cond(choice, x, key1)
         choice = self.greedy_sample_one_cond(choice, x, key2)
         #jax.debug.print("a2 {}", jnp.sum(choice.astype(jnp.int32), axis=-1)==self.dnode.D)
         #jax.debug.print("after: {}", choice)
         return choice
+
+    def adjacency_gibbs_cond(self, choice: Array, x: Array, key: PRNGKey) -> Array:
+        """this step is incorrect - removable probability should be uniform"""
+        raise NotImplementedError
+        key1, key2 = jax.random.split(key)
+        adjacencies = all_adjacencies(choice) # (remove, add, result)
+        mapmapdensity = jax.vmap(jax.vmap(self.choice_log_density, in_axes=(-2, None), out_axes=-1), in_axes=(-3, None), out_axes=-2)
+        densities = mapmapdensity(adjacencies, x)
+        removable = choice[...,:,None]
+        addable = ~choice[...,None,:]
+        identity = jnp.eye(choice.shape[-1], dtype=jnp.bool)
+        #valid = (removable & addable) | (identity & choice[...,:,None])
+        #valid = removable & addable
+        valid = jnp.sum(adjacencies, axis=-1) == self.dnode.D
+        valid = choice[...,:,None] & valid
+        densities = jnp.where(valid, densities, -jnp.inf)
+        marginal_remove = jax.scipy.special.logsumexp(densities, axis=-1)
+        to_remove = jax.random.categorical(key1, marginal_remove, axis=-1)
+        add_densities = densities[to_remove]
+        to_add = jax.random.categorical(key2, add_densities, axis=-1)
+        new_choice = adjacencies[to_remove, to_add, :]
+        #jax.debug.print("correct adjacency: {}", jnp.sum(new_choice) == self.dnode.D)
+        return new_choice
         
+    @chex.dataclass
+    class OptState:
+        mass: Array # shape: (C,)
+        position: Array # shape: (C, N)
+
+        @classmethod
+        def init(cls, model: "Model") -> "OptState":
+            return cls(
+                mass=jnp.ones((model.dnode.C,)),
+                position=model.means
+            )
+    
+    def lstsq_observe(self, x: Array, choices: Array) -> "Model":
+        x = x @ self.unnormalizer().T
+        f_choices = choices.astype(jnp.float32)
+        CC = f_choices.T @ f_choices
+        project = jnp.linalg.inv(CC + jnp.eye(CC.shape[0]))
+        new_means = project @ (f_choices.T @ x)
+        return Model(dnode=self.dnode, means=new_means)
+
+    def observe(self, state: OptState, x: Array, choices: Array) -> "OptState":
+        x = x @ self.unnormalizer().T
+        mean = jax.vmap(self.decode_mean)(choices)
+        errors = x - mean
+        pseudo_means = errors[..., None, :] + self.means
+        #weights = jnp.where(choices, 1/state.mass, 0.0)
+        weights = jnp.where(choices, 1.0, 0.0)
+        weights = weights / jnp.sum(weights, axis=-1, keepdims=True)
+        new_mass = 0.1*state.mass + jnp.sum(weights, axis=-2)
+        new_position = 0.1*state.position + jnp.sum(weights[..., None] * pseudo_means, axis=-3)
+        return self.OptState(mass=new_mass, position=new_position)
+
+    def apply(self, state: OptState) -> "Model":
+        new_means = state.position / (state.mass[..., None] + 1e-3)
+        return Model(dnode=self.dnode, means=new_means)
+
