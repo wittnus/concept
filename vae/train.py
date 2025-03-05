@@ -26,6 +26,8 @@ import ml_collections
 import optax
 import tensorflow_datasets as tfds
 
+import orbax
+
 
 @jax.vmap
 def kl_divergence(mean, logvar):
@@ -77,6 +79,12 @@ def eval_f(params, images, z, z_rng, latents):
   return nn.apply(eval_model, models.model(latents))({'params': params})
 
 
+def save_model(params, path):
+    checkpointer = orbax.checkpoint.PyTreeCheckpointer()
+    save_args = flax.training.orbax_utils.save_args_from_target(params)
+    checkpointer.save(path, params, save_args=save_args)
+
+
 def train_and_evaluate(config: ml_collections.ConfigDict):
   """Train and evaulate pipeline."""
   rng = random.key(0)
@@ -119,6 +127,7 @@ def train_and_evaluate(config: ml_collections.ConfigDict):
         comparison, f'results/reconstruction_{epoch}.png', nrow=8
     )
     vae_utils.save_image(sample, f'results/sample_{epoch}.png', nrow=8)
+    save_model(state.params, f'results/single_save')
 
     print(
         'eval epoch: {}, loss: {:.4f}, BCE: {:.4f}, KLD: {:.4f}'.format(
