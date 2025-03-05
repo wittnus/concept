@@ -15,6 +15,7 @@
 
 from absl import logging
 from flax import linen as nn
+import flax
 import input_pipeline
 import models
 import utils as vae_utils
@@ -26,7 +27,7 @@ import ml_collections
 import optax
 import tensorflow_datasets as tfds
 
-import orbax
+import orbax.checkpoint
 
 
 @jax.vmap
@@ -124,10 +125,10 @@ def train_and_evaluate(config: ml_collections.ConfigDict):
         state.params, test_ds, z, eval_rng, config.latents
     )
     vae_utils.save_image(
-        comparison, f'results/reconstruction_{epoch}.png', nrow=8
+        comparison, f'vae/results/reconstruction_{epoch}.png', nrow=8
     )
-    vae_utils.save_image(sample, f'results/sample_{epoch}.png', nrow=8)
-    save_model(state.params, f'results/single_save')
+    vae_utils.save_image(sample, f'vae/results/sample_{epoch}.png', nrow=8)
+    save_model(state.params, f'vae/results/single_save')
 
     print(
         'eval epoch: {}, loss: {:.4f}, BCE: {:.4f}, KLD: {:.4f}'.format(
