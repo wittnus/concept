@@ -15,7 +15,7 @@
 
 from absl import logging
 from flax import linen as nn
-import flax
+from flax.training import orbax_utils
 import input_pipeline
 import models
 import utils as vae_utils
@@ -82,8 +82,8 @@ def eval_f(params, images, z, z_rng, latents):
 
 def save_model(params, path):
     checkpointer = orbax.checkpoint.PyTreeCheckpointer()
-    save_args = flax.training.orbax_utils.save_args_from_target(params)
-    checkpointer.save(path, params, save_args=save_args)
+    save_args = orbax_utils.save_args_from_target(params)
+    checkpointer.save(path, params, save_args=save_args, force=True)
 
 
 def train_and_evaluate(config: ml_collections.ConfigDict):
@@ -128,7 +128,7 @@ def train_and_evaluate(config: ml_collections.ConfigDict):
         comparison, f'vae/results/reconstruction_{epoch}.png', nrow=8
     )
     vae_utils.save_image(sample, f'vae/results/sample_{epoch}.png', nrow=8)
-    save_model(state.params, f'vae/results/single_save')
+    save_model(state.params, f'/tmp/flax_ckpt/orbax/conceptvae/single_save')
 
     print(
         'eval epoch: {}, loss: {:.4f}, BCE: {:.4f}, KLD: {:.4f}'.format(
