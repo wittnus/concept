@@ -34,7 +34,7 @@ def build_train_set(batch_size, ds_builder):
 
 
 def build_test_set(ds_builder):
-  """Builds train dataset."""
+  """Builds test dataset."""
   test_ds = ds_builder.as_dataset(split=tfds.Split.TEST)
   test_ds = test_ds.map(prepare_image).batch(10000)
   test_ds = jnp.array(list(test_ds)[0])

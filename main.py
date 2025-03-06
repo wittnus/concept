@@ -170,13 +170,13 @@ def fit_model(model, data):
     @jax.value_and_grad
     def cond_entropy(model, data, choices):
         return model_entropy_at(model, data, choices)
-    P = 30
+    P = 10
     total_loss = 0.
     #total_exact_loss = 0.
     #total_exact_entropy = 0.
     choices = model.monte_carlo_sample_cond(data, PRNGKey(0))
     opt_state = model.OptState.init(model)
-    for i, subkey in enumerate(jax.random.split(PRNGKey(0), 300)):
+    for i, subkey in enumerate(jax.random.split(PRNGKey(0), 100)):
         #choices = model.monte_carlo_resample_cond(data, choices, subkey, N=3)
         key1, key2 = jax.random.split(subkey)
         #choices = model.monte_carlo_sample_cond(data, key1)
@@ -203,19 +203,84 @@ def fit_model(model, data):
             #total_exact_entropy = 0.
         #opt_state = model.observe(opt_state, data, choices)
         #model = model.apply(opt_state)
-        model = model.lstsq_observe(data, choices)
-        #dnode = tree_map(lambda p, g: p - 1e-1 * g, model.dnode, grad.dnode).renormalize()
+        model = model.cluster_var_observe(data, choices)
+        ##dnode = tree_map(lambda p, g: p - 1e-1 * g, model.dnode, grad.dnode).renormalize()
         dnode = model.dnode.observe(choices)
         model = model.replace(dnode=dnode)
+        model = model.lstsq_observe(data, choices)
         #model = tree_map(lambda p, g: p - 3e-2 * g, model, grad).renormalize_dnode()
     return model
 
+def compute_color_axis(mnist_data):
+    colors = mnist_data["color"]
+    encoding = mnist_data["encoding"]
+    mean0 = encoding[colors == 0].mean(axis=0)
+    mean1 = encoding[colors == 1].mean(axis=0)
+    return mean1 - mean0
+
+def compute_zero_one_axis(mnist_data):
+    digits = mnist_data["digit"]
+    encoding = mnist_data["encoding"]
+    mean0 = encoding[digits == 0].mean(axis=0)
+    mean1 = encoding[digits == 1].mean(axis=0)
+    return mean1 - mean0
+
+def compute_zero_all_axis(mnist_data):
+    digits = mnist_data["digit"]
+    encoding = mnist_data["encoding"]
+    mean0 = encoding[digits == 0].mean(axis=0)
+    mean1 = encoding.mean(axis=0)
+    return mean1 - mean0
+
+def plot_projected(mnist_data, list_of_sets):
+    color_axis = compute_color_axis(mnist_data)
+    zero_one_axis = compute_zero_one_axis(mnist_data)
+    zero_all_axis = compute_zero_all_axis(mnist_data)
+    invprojection = jnp.array([color_axis, zero_one_axis]).T
+    projection = jnp.linalg.pinv(invprojection)
+    for data in list_of_sets:
+        projected = data @ projection.T
+        plt.scatter(projected[:, 0], projected[:, 1])
+    plt.show()
+
+
+def train_on_mnist():
+    mnist_data = jnp.load("vae/results/encodings.npz")
+    mnist_data = jnp.load("vae/results/encoded_ds.npz")
+    classes = mnist_data["digit"]
+    colors = mnist_data["color"]
+    allowed_classes = [0, 1]
+    allowed_colors = [0, 1]
+    only_ones = mnist_data["encoding"][classes == 1]
+    only_zeros = mnist_data["encoding"][classes == 0]
+    only_twos = mnist_data["encoding"][classes == 2]
+    plot_projected(mnist_data, [only_ones, only_zeros])
+    keep = (classes[:, None] == jnp.array(allowed_classes)).any(axis=-1)
+    keep = keep & (colors[:, None] == jnp.array(allowed_colors)).any(axis=-1)
+    data = mnist_data["encoding"][keep]
+    print(f"data count: {len(data)}")
+    COV = jnp.cov(data.T)
+    print(f"covariance: {np.diag(COV)}")
+    D = 2
+    C = 20
+    N = 20
+    model = make_model(D, C, N, PRNGKey(4))
+    nll0 = model_nll(model, data)
+    print(f"nll0: {nll0}")
+    model = fit_model(model, data)
+    nll = model_nll(model, data)
+    print(f"nll: {nll}")
+    model_samples = sample_model(model, PRNGKey(5), 1000)
+    plot_projected(mnist_data, [data, model_samples])
+
 
 def main():
+    train_on_mnist()
+    exit()
     init_key = PRNGKey(1)
-    D = 2
-    C = D*2
-    N = 8
+    D = 1
+    C = D*10
+    N = 20
     dnode = DetNode.create(D, C, init_key)
     manual_embedding = jnp.array([one_hot(0,D), one_hot(0,D), one_hot(1,D), one_hot(1,D)]).T
     manual_embedding = jnp.array(
@@ -227,7 +292,7 @@ def main():
     compare_probs(dnode, PRNGKey(2))
 
     model1 = Model.create_with_dnode(dnode, N, PRNGKey(4))
-    model2 = make_model(D+2, C+4, N, PRNGKey(6))
+    model2 = make_model(D+0, C+4, N, PRNGKey(6))
     test_samples = sample_model(model1, PRNGKey(5), 3)
     print("testing in distribution sampling...")
     #for test_sample in test_samples:
@@ -242,6 +307,8 @@ def main():
 
     data_from_model1 = sample_model(model1, PRNGKey(7), 1000)
     print(f"ground truth entropy: {-model1.exact_entropy(data_from_model1).mean()}")
+    mnist_data = jnp.load("vae/results/encodings.npz")
+    #data_from_model1 = mnist_data["encoding"].reshape(-1, 20)
     #model2 = fit_model(model1, data_from_model1)
     model2 = fit_model(model2, data_from_model1)
     nll1 = model_nll(model1, data_from_model1)

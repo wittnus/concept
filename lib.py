@@ -152,14 +152,16 @@ def all_adjacencies(choice: Array) -> Array:
 class Model:
     dnode: DetNode
     means: Array  # shape: (C, N)
+    invbasis: Array # shape: (N, N)
 
     @classmethod
     def create_with_dnode(cls, dnode: DetNode, N: int, key: PRNGKey) -> "Model":
-        means = jax.random.normal(key, (dnode.C, N)) * 3.
-        return cls(dnode=dnode, means=means)
+        means = jax.random.normal(key, (dnode.C, N)) * 1.0
+        invbasis = jnp.eye(N)
+        return cls(dnode=dnode, means=means, invbasis=invbasis)
 
     def renormalize_dnode(self) -> "Model":
-        return Model(dnode=self.dnode.renormalize(), means=self.means)
+        return self.replace(dnode=self.dnode.renormalize())
 
     def total_variance(self) -> Array:
         embedding = self.dnode.embedding
@@ -177,6 +179,7 @@ class Model:
         return jnp.einsum("...i,...ij->...j", probs, means)
 
     def unnormalizer(self) -> Array:
+        return self.invbasis
         tvar_logdet = jnp.linalg.slogdet(self.total_variance())[1]
         factor = jnp.exp(0.5 * tvar_logdet / self.N)
         return jnp.eye(self.N) #* factor
@@ -410,13 +413,25 @@ class Model:
                 position=model.means
             )
     
+    @jax.jit
     def lstsq_observe(self, x: Array, choices: Array) -> "Model":
         x = x @ self.unnormalizer().T
         f_choices = choices.astype(jnp.float32)
         CC = f_choices.T @ f_choices
         project = jnp.linalg.inv(CC + jnp.eye(CC.shape[0]))
         new_means = project @ (f_choices.T @ x)
-        return Model(dnode=self.dnode, means=new_means)
+        return self.replace(means=new_means)
+
+    def cluster_var_observe(self, x: Array, choices: Array) -> "Model":
+        x = x @ self.unnormalizer().T
+        mean = jax.vmap(self.decode_mean)(choices)
+        errors = x - mean
+        error_cov = jnp.cov(errors.T)
+        root_cov = jnp.linalg.cholesky(error_cov + 1e-3*jnp.eye(self.N))
+        new_means = self.means @ root_cov.T
+        iroot = jnp.linalg.inv(root_cov)
+        new_invbasis = iroot @ self.invbasis
+        return Model(dnode=self.dnode, means=new_means, invbasis=new_invbasis)
 
     def observe(self, state: OptState, x: Array, choices: Array) -> "OptState":
         x = x @ self.unnormalizer().T

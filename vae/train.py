@@ -17,6 +17,7 @@ from absl import logging
 from flax import linen as nn
 from flax.training import orbax_utils
 import input_pipeline
+import supervised_mnist
 import models
 import utils as vae_utils
 from flax.training import train_state
@@ -26,8 +27,10 @@ import jax.numpy as jnp
 import ml_collections
 import optax
 import tensorflow_datasets as tfds
+import numpy as np
 
 import orbax.checkpoint
+from tqdm import trange, tqdm
 
 
 @jax.vmap
@@ -42,31 +45,46 @@ def binary_cross_entropy_with_logits(logits, labels):
       labels * logits + (1.0 - labels) * jnp.log(-jnp.expm1(logits))
   )
 
+@jax.vmap
+def cross_entropy_with_logits(logits, labels):
+    labels = labels.astype(jnp.int32)
+    lprobs = nn.log_softmax(logits).take(labels, axis=-1)
+    return -lprobs
+    return -jnp.sum(labels * nn.log_softmax(logits), axis=-1)
+
 
 def compute_metrics(recon_x, x, mean, logvar):
   bce_loss = binary_cross_entropy_with_logits(recon_x, x).mean()
   kld_loss = kl_divergence(mean, logvar).mean()
   return {'bce': bce_loss, 'kld': kld_loss, 'loss': bce_loss + kld_loss}
 
+def compute_super_metrics(digits_logits, colors_logits, digits, colors):
+  digit_loss = cross_entropy_with_logits(digits_logits, digits).mean()
+  color_loss = cross_entropy_with_logits(colors_logits, colors).mean()
+  return {'digit_loss': digit_loss, 'color_loss': color_loss}
+
 
 def train_step(state, batch, z_rng, latents):
   def loss_fn(params):
-    recon_x, mean, logvar = models.model(latents).apply(
-        {'params': params}, batch, z_rng
+    recon_x, mean, logvar, digit_logits, color_logits = models.model(latents).apply(
+        {'params': params}, batch.image, z_rng
     )
 
-    bce_loss = binary_cross_entropy_with_logits(recon_x, batch).mean()
+    bce_loss = binary_cross_entropy_with_logits(recon_x, batch.image).mean()
     kld_loss = kl_divergence(mean, logvar).mean()
-    loss = bce_loss + kld_loss
+    digit_loss = cross_entropy_with_logits(digit_logits, batch.digit).mean() * 10.
+    color_loss = cross_entropy_with_logits(color_logits, batch.color).mean()
+    loss = bce_loss + kld_loss + digit_loss + color_loss
     return loss
 
   grads = jax.grad(loss_fn)(state.params)
   return state.apply_gradients(grads=grads)
 
 
-def eval_f(params, images, z, z_rng, latents):
+def eval_f(params, data, z, z_rng, latents):
+  images = data.image
   def eval_model(vae):
-    recon_images, mean, logvar = vae(images, z_rng)
+    recon_images, mean, logvar, digit_logits, color_logits = vae(images, z_rng)
     comparison = jnp.concatenate([
         images[:8].reshape(-1, 28, 28, 1),
         recon_images[:8].reshape(-1, 28, 28, 1),
@@ -75,6 +93,9 @@ def eval_f(params, images, z, z_rng, latents):
     generate_images = vae.generate(z)
     generate_images = generate_images.reshape(-1, 28, 28, 1)
     metrics = compute_metrics(recon_images, images, mean, logvar)
+    super_metrics = compute_super_metrics(digit_logits, color_logits, data.digit, data.color)
+    metrics.update(super_metrics)
+    metrics['loss'] += super_metrics['digit_loss'] + super_metrics['color_loss']
     return metrics, comparison, generate_images
 
   return nn.apply(eval_model, models.model(latents))({'params': params})
@@ -85,18 +106,54 @@ def save_model(params, path):
     save_args = orbax_utils.save_args_from_target(params)
     checkpointer.save(path, params, save_args=save_args, force=True)
 
+def save_encodings(latents, state, ds, path):
+    vae = models.model(latents)
+    def compute(batch):
+        model = vae.bind({'params': state.params})
+        mean, logvar = model.encoder(batch.image)
+        recon = model.generate(mean)
+        return recon, mean
+
+    recon = []
+    encoding = []
+    for batch in ds.batched(256):
+        recon_batch, mean = compute(batch)
+        recon.append(recon_batch)
+        encoding.append(mean)
+    recon = jnp.concatenate(recon)
+    encoding = jnp.concatenate(encoding)
+    np.savez(path, recon=recon, encoding=encoding)
+
+def save_encoded_ds(latents, state, ds, path):
+    vae = models.model(latents)
+    def compute(batch):
+        model = vae.bind({'params': state.params})
+        mean, logvar = model.encoder(batch.image)
+        digit_logit = nn.log_softmax(model.classify_digit(mean), axis=-1)
+        color_logit = nn.log_softmax(model.classify_color(mean), axis=-1)
+        recon = model.generate(mean)
+        return recon, mean, logvar, digit_logit, color_logit
+    recon, encoding, logvar, digit_logit, color_logit = compute(ds)
+    image, digit, color = ds.image, ds.digit, ds.color
+    np.savez(path, recon=recon, encoding=encoding, logvar=logvar, digit_logit=digit_logit, color_logit=color_logit, image=image, digit=digit, color=color)
+
+
+
 
 def train_and_evaluate(config: ml_collections.ConfigDict):
   """Train and evaulate pipeline."""
   rng = random.key(0)
   rng, key = random.split(rng)
 
-  ds_builder = tfds.builder('binarized_mnist')
-  ds_builder.download_and_prepare()
+  #ds_builder = tfds.builder('binarized_mnist')
+  #ds_builder.download_and_prepare()
 
   logging.info('Initializing dataset.')
-  train_ds = input_pipeline.build_train_set(config.batch_size, ds_builder)
-  test_ds = input_pipeline.build_test_set(ds_builder)
+  #train_ds = input_pipeline.build_train_set(config.batch_size, ds_builder)
+  #test_ds = input_pipeline.build_test_set(ds_builder)
+  full_train_ds = supervised_mnist.load_dataset(split='train').flatten()
+  train_ds = full_train_ds.batch_stream(config.batch_size, key=random.key(0))
+  test_ds = supervised_mnist.load_dataset(split='test').flatten()
 
   logging.info('Initializing model.')
   init_data = jnp.ones((config.batch_size, 784), jnp.float32)
@@ -111,12 +168,13 @@ def train_and_evaluate(config: ml_collections.ConfigDict):
   rng, z_key, eval_rng = random.split(rng, 3)
   z = random.normal(z_key, (64, config.latents))
 
-  steps_per_epoch = (
-      ds_builder.info.splits['train'].num_examples // config.batch_size
-  )
+  steps_per_epoch = len(full_train_ds.image) // config.batch_size
+  #steps_per_epoch = (
+  #    ds_builder.info.splits['train'].num_examples // config.batch_size
+  #)
 
   for epoch in range(config.num_epochs):
-    for _ in range(steps_per_epoch):
+    for _ in trange(steps_per_epoch):
       batch = next(train_ds)
       rng, key = random.split(rng)
       state = train_step(state, batch, key, config.latents)
@@ -125,13 +183,11 @@ def train_and_evaluate(config: ml_collections.ConfigDict):
         state.params, test_ds, z, eval_rng, config.latents
     )
     vae_utils.save_image(
-        comparison, f'vae/results/reconstruction_{epoch}.png', nrow=8
+            comparison, f'vae/results/reconstruction_{epoch:02d}.png', nrow=8
     )
-    vae_utils.save_image(sample, f'vae/results/sample_{epoch}.png', nrow=8)
-    save_model(state.params, f'/tmp/flax_ckpt/orbax/conceptvae/single_save')
+    vae_utils.save_image(sample, f'vae/results/sample_{epoch:02d}.png', nrow=8)
 
-    print(
-        'eval epoch: {}, loss: {:.4f}, BCE: {:.4f}, KLD: {:.4f}'.format(
-            epoch + 1, metrics['loss'], metrics['bce'], metrics['kld']
-        )
-    )
+    print(f"eval epoch: {epoch + 1}, loss: {metrics['loss']:.4f}, BCE: {metrics['bce']:.4f}, KLD: {metrics['kld']:.4f}, digit: {metrics['digit_loss']:.4f}, color: {metrics['color_loss']:.4f}")
+  save_encodings(config.latents, state, test_ds, 'vae/results/encodings.npz')
+  save_encoded_ds(config.latents, state, test_ds, 'vae/results/encoded_ds.npz')
+  save_model(state.params, f'/tmp/flax_ckpt/orbax/conceptvae/single_save')

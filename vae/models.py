@@ -52,12 +52,16 @@ class VAE(nn.Module):
   def setup(self):
     self.encoder = Encoder(self.latents)
     self.decoder = Decoder()
+    self.classify_digit = nn.Dense(10)
+    self.classify_color = nn.Dense(2)
 
   def __call__(self, x, z_rng):
     mean, logvar = self.encoder(x)
     z = reparameterize(z_rng, mean, logvar)
+    digit_logits = self.classify_digit(z)
+    color_logits = self.classify_color(z)
     recon_x = self.decoder(z)
-    return recon_x, mean, logvar
+    return recon_x, mean, logvar, digit_logits, color_logits
 
   def generate(self, z):
     return nn.sigmoid(self.decoder(z))
