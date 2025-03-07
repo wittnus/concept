@@ -31,6 +31,7 @@ import numpy as np
 
 import orbax.checkpoint
 from tqdm import trange, tqdm
+from pathlib import Path
 
 
 @jax.vmap
@@ -72,7 +73,7 @@ def train_step(state, batch, z_rng, latents):
 
     bce_loss = binary_cross_entropy_with_logits(recon_x, batch.image).mean()
     kld_loss = kl_divergence(mean, logvar).mean()
-    digit_loss = cross_entropy_with_logits(digit_logits, batch.digit).mean() * 10.
+    digit_loss = cross_entropy_with_logits(digit_logits, batch.digit).mean() * 1e1
     color_loss = cross_entropy_with_logits(color_logits, batch.color).mean()
     loss = bce_loss + kld_loss + digit_loss + color_loss
     return loss
@@ -151,9 +152,10 @@ def train_and_evaluate(config: ml_collections.ConfigDict):
   logging.info('Initializing dataset.')
   #train_ds = input_pipeline.build_train_set(config.batch_size, ds_builder)
   #test_ds = input_pipeline.build_test_set(ds_builder)
-  full_train_ds = supervised_mnist.load_dataset(split='train').flatten()
+  allowed_digits = np.array([0, 1, 2, 3])
+  full_train_ds = supervised_mnist.load_dataset(split='train', allowed_digits=allowed_digits).flatten()
   train_ds = full_train_ds.batch_stream(config.batch_size, key=random.key(0))
-  test_ds = supervised_mnist.load_dataset(split='test').flatten()
+  test_ds = supervised_mnist.load_dataset(split='test', allowed_digits=allowed_digits).flatten()
 
   logging.info('Initializing model.')
   init_data = jnp.ones((config.batch_size, 784), jnp.float32)
@@ -173,6 +175,8 @@ def train_and_evaluate(config: ml_collections.ConfigDict):
   #    ds_builder.info.splits['train'].num_examples // config.batch_size
   #)
 
+  save_path = Path(__file__).parent / 'results'
+
   for epoch in range(config.num_epochs):
     for _ in trange(steps_per_epoch):
       batch = next(train_ds)
@@ -183,11 +187,11 @@ def train_and_evaluate(config: ml_collections.ConfigDict):
         state.params, test_ds, z, eval_rng, config.latents
     )
     vae_utils.save_image(
-            comparison, f'vae/results/reconstruction_{epoch:02d}.png', nrow=8
+            comparison, save_path / f'reconstruction_{epoch:02d}.png', nrow=8
     )
-    vae_utils.save_image(sample, f'vae/results/sample_{epoch:02d}.png', nrow=8)
+    vae_utils.save_image(sample, save_path / f'sample_{epoch:02d}.png', nrow=8)
 
     print(f"eval epoch: {epoch + 1}, loss: {metrics['loss']:.4f}, BCE: {metrics['bce']:.4f}, KLD: {metrics['kld']:.4f}, digit: {metrics['digit_loss']:.4f}, color: {metrics['color_loss']:.4f}")
-  save_encodings(config.latents, state, test_ds, 'vae/results/encodings.npz')
-  save_encoded_ds(config.latents, state, test_ds, 'vae/results/encoded_ds.npz')
-  save_model(state.params, f'/tmp/flax_ckpt/orbax/conceptvae/single_save')
+    save_encodings(config.latents, state, test_ds, save_path / 'encodings.npz')
+    save_encoded_ds(config.latents, state, test_ds, save_path / 'encoded_ds.npz')
+    save_model(state.params, save_path / f'single_save')

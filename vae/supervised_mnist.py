@@ -39,14 +39,20 @@ class Datum:
         pixels = int(jnp.prod(jnp.array(im_shape[-3:])))
         return self.replace(image=self.image.reshape(im_shape[:-3] + (pixels,)))
 
+    def digit_filter(self, allowed_digits):
+        mask = jnp.isin(self.digit, allowed_digits)
+        return tree_map(lambda x: x[mask], self)
+
 def shuffle(data, key):
     perm = jax.random.permutation(key, len(data['image']))
     return tree_map(lambda x: x[perm], data)
 
-def load_dataset(split):
+def load_dataset(split, allowed_digits=None):
     ds = tfds.load('mnist', split=split, batch_size=-1)
     ds = tfds.as_numpy(ds)
     ds = Datum.init(ds)
+    if allowed_digits is not None:
+        ds = ds.digit_filter(allowed_digits)
     ds = ds.binarize()
     ids = ds.invert()
     ds = tree_map(lambda x, y: jnp.concatenate([x, y], axis=0), ds, ids)

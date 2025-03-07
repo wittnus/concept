@@ -14,6 +14,13 @@ from jax.tree_util import tree_map
 
 import matplotlib
 from matplotlib import pyplot as plt
+import pandas as pd
+import seaborn as sns
+import vae.utils as vae_utils
+import vae_lib as vae_lib
+from collections import namedtuple
+
+from PIL import Image
 
 matplotlib.use("TkAgg")
 
@@ -204,7 +211,7 @@ def fit_model(model, data):
         #opt_state = model.observe(opt_state, data, choices)
         #model = model.apply(opt_state)
         model = model.cluster_var_observe(data, choices)
-        ##dnode = tree_map(lambda p, g: p - 1e-1 * g, model.dnode, grad.dnode).renormalize()
+        #dnode = tree_map(lambda p, g: p - 1e-1 * g, model.dnode, grad.dnode).renormalize()
         dnode = model.dnode.observe(choices)
         model = model.replace(dnode=dnode)
         model = model.lstsq_observe(data, choices)
@@ -218,51 +225,157 @@ def compute_color_axis(mnist_data):
     mean1 = encoding[colors == 1].mean(axis=0)
     return mean1 - mean0
 
-def compute_zero_one_axis(mnist_data):
+def compute_digit_axis(mnist_data, digit0, digit1=None):
     digits = mnist_data["digit"]
     encoding = mnist_data["encoding"]
-    mean0 = encoding[digits == 0].mean(axis=0)
-    mean1 = encoding[digits == 1].mean(axis=0)
+    mean0 = encoding[digits == digit0].mean(axis=0)
+    if digit1 is None:
+        mean1 = encoding.mean(axis=0)
+    else:
+        mean1 = encoding[digits == digit1].mean(axis=0)
     return mean1 - mean0
 
-def compute_zero_all_axis(mnist_data):
-    digits = mnist_data["digit"]
-    encoding = mnist_data["encoding"]
-    mean0 = encoding[digits == 0].mean(axis=0)
-    mean1 = encoding.mean(axis=0)
-    return mean1 - mean0
-
-def plot_projected(mnist_data, list_of_sets):
+def digit_color_project(mnist_data, encoding):
     color_axis = compute_color_axis(mnist_data)
-    zero_one_axis = compute_zero_one_axis(mnist_data)
-    zero_all_axis = compute_zero_all_axis(mnist_data)
-    invprojection = jnp.array([color_axis, zero_one_axis]).T
+    digit_axes = [compute_digit_axis(mnist_data, i) for i in range(5)]
+    invprojection = jnp.array(digit_axes+[color_axis]).T
+    projection = jnp.linalg.pinv(invprojection)
+    return encoding @ projection.T
+
+def make_dataframe(mnist_data):
+    MAX = 1000
+    digits = mnist_data["digit"][:MAX]
+    colors = mnist_data["color"][:MAX]
+    projected = digit_color_project(mnist_data, mnist_data["encoding"][:MAX])
+    df = pd.DataFrame({
+        "digit": [str(d) for d in digits],
+        "color": ["black" if c == 0 else "white" for c in colors]
+    })
+    for i in range(projected.shape[1]):
+        df[f"dim{i}"] = projected[:, i]
+    return df[df["digit"].isin(["0", "1", "2", "3", "4"])]
+
+def plot_projected(mnist_data, list_of_sets, digit=0):
+    color_axis = compute_color_axis(mnist_data)
+    #digit_axes = [compute_digit_axis(mnist_data, i) for i in range(1)]
+    digit_axes = [compute_digit_axis(mnist_data, digit)]
+    invprojection = jnp.array(digit_axes+[color_axis]).T
     projection = jnp.linalg.pinv(invprojection)
     for data in list_of_sets:
         projected = data @ projection.T
-        plt.scatter(projected[:, 0], projected[:, 1])
+        plt.scatter(projected[:, 0], projected[:, -1])
     plt.show()
+
+def pair_plot(mnist_data):
+    df = make_dataframe(mnist_data)
+    print(df.head())
+    sns.pairplot(df, hue="digit", palette="husl", plot_kws=dict(size=df["color"]))
+    plt.show()
+
+def choose_for_concept(choices, concept_index, count=32, negate=False):
+    key = PRNGKey(0)
+    if negate:
+        _choices = 1 - choices
+    else:
+        _choices = choices
+    indices = jax.random.categorical(key, jnp.log(_choices[:, concept_index]), shape=(count,))
+    return indices
+
+def embed_covariance(embed):
+    cov = embed.T @ embed
+    cov = cov**2 / jnp.diag(cov)[:, None]
+    return cov
+
+def resample_concept(model, choices, concept_index, key):
+    C = choices.shape[-1]
+    cond_lprobs = jnp.log(1. - jax.nn.one_hot(concept_index, C))
+    def resample(choice, key):
+        choice = choice.at[concept_index].set(0)
+        sample, _ = model.dnode.sample_one_cond(choice, cond_lprobs, key)
+        choice = choice.at[sample].set(1)
+        return choice
+    new_choices = jax.vmap(resample)(choices, jax.random.split(key, len(choices)))
+    #print(choices[:, concept_index].all(), ~new_choices[:, concept_index].any())
+    #print((choices.sum(axis=-1) == 3).all(), (new_choices.sum(axis=-1) == 3).all())
+    return new_choices
+
+def apply_choice_diff(model, old_choices, new_choices, data):
+    latent_diff = jax.vmap(model.decode_mean)(new_choices) - jax.vmap(model.decode_mean)(old_choices)
+    latent_diff = latent_diff @ model.normalizer().T
+    return data + latent_diff
+
+class LatentDecoder:
+    def __init__(self):
+        config = namedtuple("Config", ["batch_size", "latents"])(batch_size=128, latents=20)
+        model, params = vae_lib.load_model(config)
+        self.model = model
+        self.params = params
+    def __call__(self, z):
+        return vae_lib.decode(self.model, self.params, z)
+
+
+
+def save_concepts(model, choices, z, recons, concept_embed, truncate=32, row_size=32):
+    C = choices.shape[1]
+    positive_indices = [choose_for_concept(choices, i, count=row_size) for i in range(C)]
+    negative_indices = [choose_for_concept(choices, i, count=row_size, negate=True) for i in range(C)]
+    concept_probs = choices.mean(axis=0)
+    concept_ent = -jnp.log(concept_probs) * concept_probs
+    sorted_indices = jnp.argsort(concept_ent, descending=True)[:truncate]
+    np.set_printoptions(precision=2, suppress=True)
+    sorted_choices = choices[:, sorted_indices]
+    sorted_probs = concept_probs[sorted_indices]
+    print(f"probs: {sorted_probs}")
+    print(f"entropy: {-jnp.log(sorted_probs)*sorted_probs}")
+    embed_cov = embed_covariance(concept_embed[:,sorted_indices])
+    print(f"embed_cov:\n{embed_cov}")
+
+    chosen_recons = jnp.concatenate([recons[positive_indices[i]] for i in sorted_indices])
+    chosen_recons = chosen_recons.reshape(-1, 28, 28, 1)
+    vae_utils.save_image(chosen_recons, "results/concepts.png", nrow=row_size)
+    chosen_not_recons = jnp.concatenate([recons[negative_indices[i]] for i in sorted_indices])
+    chosen_not_recons = chosen_not_recons.reshape(-1, 28, 28, 1)
+    vae_utils.save_image(chosen_not_recons, "results/concepts_not.png", nrow=row_size)
+
+    decoder = LatentDecoder()
+    for i, concept_index in enumerate(sorted_indices):
+        pchoices = choices[positive_indices[concept_index]]
+        assert pchoices[:, concept_index].all()
+        old_z = z[positive_indices[concept_index]]
+        old_image = decoder(old_z)
+        new_images = []
+        for j in range(10):
+            new_choices = resample_concept(model, pchoices, concept_index, PRNGKey(j))
+            new_z = apply_choice_diff(model, pchoices, new_choices, old_z)
+            new_image = decoder(new_z)
+            new_images.append(new_image)
+        all_images = jnp.concatenate([old_image] + new_images).reshape(-1, 28, 28, 1)
+        vae_utils.save_image(all_images, f"results/concept_{i}.png", nrow=row_size)
+
 
 
 def train_on_mnist():
     mnist_data = jnp.load("vae/results/encodings.npz")
     mnist_data = jnp.load("vae/results/encoded_ds.npz")
+    #pair_plot(mnist_data)
+    #exit()
     classes = mnist_data["digit"]
     colors = mnist_data["color"]
-    allowed_classes = [0, 1]
+    allowed_classes = [0, 1, 2, 3]
     allowed_colors = [0, 1]
     only_ones = mnist_data["encoding"][classes == 1]
     only_zeros = mnist_data["encoding"][classes == 0]
     only_twos = mnist_data["encoding"][classes == 2]
-    plot_projected(mnist_data, [only_ones, only_zeros])
+    #plot_projected(mnist_data, [only_zeros, only_ones, only_twos])
     keep = (classes[:, None] == jnp.array(allowed_classes)).any(axis=-1)
     keep = keep & (colors[:, None] == jnp.array(allowed_colors)).any(axis=-1)
     data = mnist_data["encoding"][keep]
+    recon = mnist_data["recon"][keep]
     print(f"data count: {len(data)}")
     COV = jnp.cov(data.T)
     print(f"covariance: {np.diag(COV)}")
     D = 2
-    C = 20
+    C = 10
     N = 20
     model = make_model(D, C, N, PRNGKey(4))
     nll0 = model_nll(model, data)
@@ -270,8 +383,12 @@ def train_on_mnist():
     model = fit_model(model, data)
     nll = model_nll(model, data)
     print(f"nll: {nll}")
-    model_samples = sample_model(model, PRNGKey(5), 1000)
-    plot_projected(mnist_data, [data, model_samples])
+    data_choice_samples = jax.vmap(model.exact_cond_sample)(data, jax.random.split(PRNGKey(0), len(data)))
+    save_concepts(model, data_choice_samples, data, recon, model.dnode.embedding)
+    exit()
+    model_samples = sample_model(model, PRNGKey(5), len(data))
+    for digit in allowed_classes:
+        plot_projected(mnist_data, [data, model_samples], digit=digit)
 
 
 def main():

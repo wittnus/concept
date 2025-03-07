@@ -1,4 +1,4 @@
-import models
+import vae.models as models
 import orbax.checkpoint
 import jax
 from jax.random import PRNGKey
@@ -8,7 +8,7 @@ from pathlib import Path
 
 def load_model(config, path=None):
     if path is None:
-        path = Path(__file__).parent.resolve() / Path("results/single_save")
+        path = Path(__file__).parent.resolve() / Path("vae/results/single_save")
     key = PRNGKey(0)
     key, rng = jax.random.split(key)
     init_data = jnp.ones((config.batch_size, 784), jnp.float32)
@@ -29,7 +29,7 @@ def decode(model, params, z):
 
 
 def main():
-    path = Path(__file__).parent.resolve() / Path("results/single_save")
+    path = Path(__file__).parent.resolve() / Path("vae/results/single_save")
     config = namedtuple("Config", ["batch_size", "latents"])(batch_size=128, latents=20)
     model, params = load_model(config, path)
     mean, logvar = encode(model, params, jnp.ones((config.batch_size, 784), jnp.float32))

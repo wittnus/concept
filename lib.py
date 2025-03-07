@@ -117,7 +117,15 @@ class DetNode:
         Minvroots = invroot(Ms)
         observed_embeddings = jnp.einsum("...ij,...jk->...ik", Minvroots, active_embeddings)
         total_embedding = jnp.sum(observed_embeddings, axis=-3)
-        return DetNode(embedding=total_embedding).renormalize()
+        choice_counts = jnp.sum(choices, axis=-2)
+        total_embedding = total_embedding / jnp.linalg.norm(total_embedding, axis=-2, keepdims=True)
+        total_embedding = total_embedding * jnp.sqrt(choice_counts)
+        new_node = DetNode(embedding=total_embedding).renormalize()
+        new_embedding = self.embedding + 0.1*new_node.embedding
+
+        new_embedding = new_embedding / jnp.linalg.norm(new_embedding, axis=-2, keepdims=True)
+        new_embedding = new_embedding * jnp.sqrt(choice_counts)
+        return DetNode(embedding=new_embedding).renormalize()
 
 
 
