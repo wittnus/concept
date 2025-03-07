@@ -302,6 +302,9 @@ def resample_concept(model, choices, concept_index, key):
 def apply_choice_diff(model, old_choices, new_choices, data):
     latent_diff = jax.vmap(model.decode_mean)(new_choices) - jax.vmap(model.decode_mean)(old_choices)
     latent_diff = latent_diff @ model.normalizer().T
+    new_means = jax.vmap(model.decode_mean)(new_choices)
+    noise = jax.random.normal(PRNGKey(0), new_means.shape)
+    return jax.vmap(model.decode_mean)(new_choices) @ model.normalizer().T
     return data + latent_diff
 
 class LatentDecoder:
@@ -342,6 +345,7 @@ def save_concepts(model, choices, z, recons, concept_embed, truncate=32, row_siz
         pchoices = choices[positive_indices[concept_index]]
         assert pchoices[:, concept_index].all()
         old_z = z[positive_indices[concept_index]]
+        old_z = apply_choice_diff(model, pchoices, pchoices, old_z)
         old_image = decoder(old_z)
         new_images = []
         for j in range(10):
@@ -350,7 +354,7 @@ def save_concepts(model, choices, z, recons, concept_embed, truncate=32, row_siz
             new_image = decoder(new_z)
             new_images.append(new_image)
         all_images = jnp.concatenate([old_image] + new_images).reshape(-1, 28, 28, 1)
-        vae_utils.save_image(all_images, f"results/concept_{i}.png", nrow=row_size)
+        vae_utils.save_image(all_images, f"results/concept_{i:02d}.png", nrow=row_size)
 
 
 
@@ -374,8 +378,8 @@ def train_on_mnist():
     print(f"data count: {len(data)}")
     COV = jnp.cov(data.T)
     print(f"covariance: {np.diag(COV)}")
-    D = 2
-    C = 10
+    D = 3
+    C = 20
     N = 20
     model = make_model(D, C, N, PRNGKey(4))
     nll0 = model_nll(model, data)

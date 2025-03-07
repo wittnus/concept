@@ -73,8 +73,8 @@ def train_step(state, batch, z_rng, latents):
 
     bce_loss = binary_cross_entropy_with_logits(recon_x, batch.image).mean()
     kld_loss = kl_divergence(mean, logvar).mean()
-    digit_loss = cross_entropy_with_logits(digit_logits, batch.digit).mean() * 1e1
-    color_loss = cross_entropy_with_logits(color_logits, batch.color).mean()
+    digit_loss = cross_entropy_with_logits(digit_logits, batch.digit).mean() * 0e1
+    color_loss = cross_entropy_with_logits(color_logits, batch.color).mean() * 0e1
     loss = bce_loss + kld_loss + digit_loss + color_loss
     return loss
 
