@@ -43,6 +43,20 @@ class Datum:
         mask = jnp.isin(self.digit, allowed_digits)
         return tree_map(lambda x: x[mask], self)
 
+    def set_width(self, width):
+        new_shape = self.image.shape[:-2] + (width,) + self.image.shape[-1:]
+        new_image = jax.image.resize(self.image, new_shape, method='linear')
+        return self.replace(image=new_image)
+
+def side_by_side(d1, d2, margin):
+    shape = d1.image.shape
+    W = shape[-2]
+    new_W = 2 * W - margin
+    out = jnp.zeros(shape[:-2] + (new_W,) + shape[-1:])
+    out = out.at[..., :W, :].set(d1.image)
+    out = out.at[..., -W:, :].add(d2.image)
+    return d1.replace(image=out)
+
 def shuffle(data, key):
     perm = jax.random.permutation(key, len(data['image']))
     return tree_map(lambda x: x[perm], data)
@@ -53,9 +67,12 @@ def load_dataset(split, allowed_digits=None):
     ds = Datum.init(ds)
     if allowed_digits is not None:
         ds = ds.digit_filter(allowed_digits)
+    ds2 = shuffle(ds, jax.random.PRNGKey(1))
+    ds = side_by_side(ds, ds2, margin=6)
+    ds = ds.set_width(28)
     ds = ds.binarize()
-    ids = ds.invert()
-    ds = tree_map(lambda x, y: jnp.concatenate([x, y], axis=0), ds, ids)
+    #ids = ds.invert()
+    #ds = tree_map(lambda x, y: jnp.concatenate([x, y], axis=0), ds, ids)
     ds = shuffle(ds, jax.random.PRNGKey(0))
     return ds
 

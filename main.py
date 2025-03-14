@@ -183,7 +183,7 @@ def fit_model(model, data):
     #total_exact_entropy = 0.
     choices = model.monte_carlo_sample_cond(data, PRNGKey(0))
     opt_state = model.OptState.init(model)
-    for i, subkey in enumerate(jax.random.split(PRNGKey(0), 100)):
+    for i, subkey in enumerate(jax.random.split(PRNGKey(0), 300)):
         #choices = model.monte_carlo_resample_cond(data, choices, subkey, N=3)
         key1, key2 = jax.random.split(subkey)
         #choices = model.monte_carlo_sample_cond(data, key1)
@@ -213,6 +213,7 @@ def fit_model(model, data):
         model = model.cluster_var_observe(data, choices)
         #dnode = tree_map(lambda p, g: p - 1e-1 * g, model.dnode, grad.dnode).renormalize()
         dnode = model.dnode.observe(choices)
+        #dnode = dnode.orthogonalize()
         model = model.replace(dnode=dnode)
         model = model.lstsq_observe(data, choices)
         #model = tree_map(lambda p, g: p - 3e-2 * g, model, grad).renormalize_dnode()
@@ -307,6 +308,11 @@ def apply_choice_diff(model, old_choices, new_choices, data):
     return jax.vmap(model.decode_mean)(new_choices) @ model.normalizer().T
     return data + latent_diff
 
+def resample_gauss(model, choices, key):
+    means = jax.vmap(model.decode_mean)(choices)
+    noise = jax.random.normal(key, means.shape)
+    return (means + noise) @ model.normalizer().T
+
 class LatentDecoder:
     def __init__(self):
         config = namedtuple("Config", ["batch_size", "latents"])(batch_size=128, latents=20)
@@ -318,13 +324,15 @@ class LatentDecoder:
 
 
 
-def save_concepts(model, choices, z, recons, concept_embed, truncate=32, row_size=32):
+def save_concepts(model, choices, z, recons, concept_embed, truncate=16, row_size=16):
     C = choices.shape[1]
     positive_indices = [choose_for_concept(choices, i, count=row_size) for i in range(C)]
     negative_indices = [choose_for_concept(choices, i, count=row_size, negate=True) for i in range(C)]
     concept_probs = choices.mean(axis=0)
     concept_ent = -jnp.log(concept_probs) * concept_probs
     sorted_indices = jnp.argsort(concept_ent, descending=True)[:truncate]
+    # disable sorting
+    sorted_indices = jnp.arange(concept_ent.shape[0])[:truncate]
     np.set_printoptions(precision=2, suppress=True)
     sorted_choices = choices[:, sorted_indices]
     sorted_probs = concept_probs[sorted_indices]
@@ -356,6 +364,49 @@ def save_concepts(model, choices, z, recons, concept_embed, truncate=32, row_siz
         all_images = jnp.concatenate([old_image] + new_images).reshape(-1, 28, 28, 1)
         vae_utils.save_image(all_images, f"results/concept_{i:02d}.png", nrow=row_size)
 
+    key = PRNGKey(0)
+    model_samples = jax.vmap(model.sample)(jax.random.split(key, row_size*4))[0]
+    gauss_samples = jax.vmap(model.sample_closest_gaussian)(jax.random.split(key, row_size*4))
+    model_images = decoder(model_samples)
+    zero_images = jnp.zeros((row_size,) + model_images.shape[1:])
+    gauss_images = decoder(gauss_samples)
+    all_images = jnp.concatenate([model_images, zero_images, gauss_images])
+    all_images = all_images.reshape(-1, 28, 28, 1)
+    vae_utils.save_image(all_images, "results/model_and_gauss.png", nrow=row_size)
+
+    save_recon_and_resample(model, choices, z, steps=4, row_size=row_size)
+
+def save_recon_and_resample(model, choices, z, steps, row_size):
+    key = PRNGKey(0)
+    decoder = LatentDecoder()
+    zs = z[:row_size]
+    means = jax.vmap(model.decode_mean)(choices[:row_size]) @ model.normalizer().T
+    recons_0 = decoder(zs)
+    recons = [recons_0.copy()]
+    zero_recons = jnp.zeros_like(recons_0)
+    new_zs = zs.copy()
+    for key in jax.random.split(key, steps):
+        sample = resample_gauss(model, choices[:row_size], key)
+        new_zs = (new_zs - means)/jnp.sqrt(2) + (sample - means)/jnp.sqrt(2) + means
+        recons.append(decoder(new_zs))
+    recons.append(zero_recons)
+    recons.append(recons_0.copy())
+    new_zs = zs.copy()
+    for key in jax.random.split(key, steps):
+        sample = jax.vmap(model.sample_closest_gaussian)(jax.random.split(key, row_size))
+        new_zs = new_zs/jnp.sqrt(2) + sample/jnp.sqrt(2)
+        recons.append(decoder(new_zs))
+    all_images = jnp.concatenate(recons)
+    all_images = all_images.reshape(-1, 28, 28, 1)
+    vae_utils.save_image(all_images, "results/recon_and_resample.png", nrow=row_size)
+
+
+
+
+
+
+
+
 
 
 def train_on_mnist():
@@ -378,7 +429,7 @@ def train_on_mnist():
     print(f"data count: {len(data)}")
     COV = jnp.cov(data.T)
     print(f"covariance: {np.diag(COV)}")
-    D = 3
+    D = 2
     C = 20
     N = 20
     model = make_model(D, C, N, PRNGKey(4))

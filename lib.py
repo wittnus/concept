@@ -16,7 +16,6 @@ def reject(U: Array, v: Array) -> Array:
     proj = proj * v[..., None]
     return U - proj
 
-
 @chex.dataclass
 class DetNode:
     embedding: Array  # shape: (D, C)
@@ -31,6 +30,12 @@ class DetNode:
         invroot = jnp.linalg.inv(jnp.linalg.cholesky(M))
         embedding = invroot @ self.embedding
         return DetNode(embedding=embedding)
+
+    def orthogonalize(self) -> "DetNode":
+        c_idx = jnp.arange(self.C)[None, :]
+        d_idx = jnp.arange(self.D)[:, None]
+        mask = (c_idx * self.D) // self.C == d_idx
+        return DetNode(embedding=jnp.where(mask, self.embedding, 0.0)).renormalize()
 
     @property
     def D(self) -> int:
@@ -216,6 +221,14 @@ class Model:
         sample = center + noise
         sample = self.normalizer() @ sample
         return sample, prob
+
+    @jax.jit
+    def sample_closest_gaussian(self, key:PRNGKey) -> Array:
+        V = self.total_variance()
+        Vchol = jnp.linalg.cholesky(V)
+        noise = jax.random.normal(key, (self.N,))
+        norm_noise = Vchol @ noise
+        return self.normalizer() @ norm_noise
 
     @jax.jit
     def safe_sample(self, key: PRNGKey) -> Tuple[Array, Array]:
