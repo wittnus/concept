@@ -166,7 +166,7 @@ def model_stochastic_entropy(model, data, key):
     return -neg_entropy.mean(), counts.mean(axis=0)
     return -model.stochastic_entropy(data, key).mean()
 
-def fit_model(model, data):
+def fit_model(model, data, compare_exact=True):
     @jax.jit
     @partial(jax.value_and_grad, has_aux=True)
     def loss_grad(model, data, key):
@@ -179,37 +179,24 @@ def fit_model(model, data):
         return model_entropy_at(model, data, choices)
     P = 10
     total_loss = 0.
-    #total_exact_loss = 0.
-    #total_exact_entropy = 0.
     choices = model.monte_carlo_sample_cond(data, PRNGKey(0))
-    opt_state = model.OptState.init(model)
-    for i, subkey in enumerate(jax.random.split(PRNGKey(0), 300)):
-        #choices = model.monte_carlo_resample_cond(data, choices, subkey, N=3)
+    for i, subkey in enumerate(tqdm(jax.random.split(PRNGKey(0), 500))):
         key1, key2 = jax.random.split(subkey)
-        #choices = model.monte_carlo_sample_cond(data, key1)
-        #choices = model.monte_carlo_resample_cond(data, choices, key2, N=100)
-        choices = jax.vmap(model.exact_cond_sample)(data, jax.random.split(key1, data.shape[0]))
+        #if i % 10 == 0:
+        #    choices = model.monte_carlo_sample_cond(data, key1)
+        #else:
+        choices = model.monte_carlo_resample_cond(data, choices, key2, N=1)
+        #choices = jax.vmap(model.exact_cond_sample)(data, jax.random.split(key1, data.shape[0]))
         loss, grad = cond_entropy(model, data, choices)
-        #(loss, counts), grad = loss_grad(model, data, subkey)
-        #print(counts)
-        #exact_loss = jax.jit(model_nll)(model, data)
-        #exact_entropy = jax.jit(model_entropy)(model, data)
         total_loss += loss
-        #total_exact_loss += exact_loss
-        #total_exact_entropy += exact_entropy
-        #if i % 10 == 9:
-        #    choices = model.monte_carlo_sample_cond(data, subkey)
         if i % P == P-1:
-            exact_loss = model_nll(model, data)
-            exact_entropy = model_entropy(model, data)
-            print(f"loss: {total_loss/P:.3f} (ent: {exact_entropy:.3f} exact: {exact_loss:.3f})")
-            #_, counts = model_stochastic_entropy(model, data, subkey)
-            #print(counts)
+            to_print = f"loss: {total_loss/P:.3f}"
+            if compare_exact:
+                exact_loss = model_nll(model, data)
+                exact_entropy = model_entropy(model, data)
+                to_print += f" (ent: {exact_entropy:.3f} exact: {exact_loss:.3f})"
+            print(to_print)
             total_loss = 0.
-            #total_exact_loss = 0.
-            #total_exact_entropy = 0.
-        #opt_state = model.observe(opt_state, data, choices)
-        #model = model.apply(opt_state)
         model = model.cluster_var_observe(data, choices)
         #dnode = tree_map(lambda p, g: p - 1e-1 * g, model.dnode, grad.dnode).renormalize()
         dnode = model.dnode.observe(choices)
@@ -217,61 +204,7 @@ def fit_model(model, data):
         model = model.replace(dnode=dnode)
         model = model.lstsq_observe(data, choices)
         #model = tree_map(lambda p, g: p - 3e-2 * g, model, grad).renormalize_dnode()
-    return model
-
-def compute_color_axis(mnist_data):
-    colors = mnist_data["color"]
-    encoding = mnist_data["encoding"]
-    mean0 = encoding[colors == 0].mean(axis=0)
-    mean1 = encoding[colors == 1].mean(axis=0)
-    return mean1 - mean0
-
-def compute_digit_axis(mnist_data, digit0, digit1=None):
-    digits = mnist_data["digit"]
-    encoding = mnist_data["encoding"]
-    mean0 = encoding[digits == digit0].mean(axis=0)
-    if digit1 is None:
-        mean1 = encoding.mean(axis=0)
-    else:
-        mean1 = encoding[digits == digit1].mean(axis=0)
-    return mean1 - mean0
-
-def digit_color_project(mnist_data, encoding):
-    color_axis = compute_color_axis(mnist_data)
-    digit_axes = [compute_digit_axis(mnist_data, i) for i in range(5)]
-    invprojection = jnp.array(digit_axes+[color_axis]).T
-    projection = jnp.linalg.pinv(invprojection)
-    return encoding @ projection.T
-
-def make_dataframe(mnist_data):
-    MAX = 1000
-    digits = mnist_data["digit"][:MAX]
-    colors = mnist_data["color"][:MAX]
-    projected = digit_color_project(mnist_data, mnist_data["encoding"][:MAX])
-    df = pd.DataFrame({
-        "digit": [str(d) for d in digits],
-        "color": ["black" if c == 0 else "white" for c in colors]
-    })
-    for i in range(projected.shape[1]):
-        df[f"dim{i}"] = projected[:, i]
-    return df[df["digit"].isin(["0", "1", "2", "3", "4"])]
-
-def plot_projected(mnist_data, list_of_sets, digit=0):
-    color_axis = compute_color_axis(mnist_data)
-    #digit_axes = [compute_digit_axis(mnist_data, i) for i in range(1)]
-    digit_axes = [compute_digit_axis(mnist_data, digit)]
-    invprojection = jnp.array(digit_axes+[color_axis]).T
-    projection = jnp.linalg.pinv(invprojection)
-    for data in list_of_sets:
-        projected = data @ projection.T
-        plt.scatter(projected[:, 0], projected[:, -1])
-    plt.show()
-
-def pair_plot(mnist_data):
-    df = make_dataframe(mnist_data)
-    print(df.head())
-    sns.pairplot(df, hue="digit", palette="husl", plot_kws=dict(size=df["color"]))
-    plt.show()
+    return model, choices
 
 def choose_for_concept(choices, concept_index, count=32, negate=False):
     key = PRNGKey(0)
@@ -412,8 +345,6 @@ def save_recon_and_resample(model, choices, z, steps, row_size):
 def train_on_mnist():
     mnist_data = jnp.load("vae/results/encodings.npz")
     mnist_data = jnp.load("vae/results/encoded_ds.npz")
-    #pair_plot(mnist_data)
-    #exit()
     classes = mnist_data["digit"]
     colors = mnist_data["color"]
     allowed_classes = [0, 1, 2, 3]
@@ -429,29 +360,25 @@ def train_on_mnist():
     print(f"data count: {len(data)}")
     COV = jnp.cov(data.T)
     print(f"covariance: {np.diag(COV)}")
-    D = 2
+    D = 4
     C = 20
     N = 20
     model = make_model(D, C, N, PRNGKey(4))
-    nll0 = model_nll(model, data)
-    print(f"nll0: {nll0}")
-    model = fit_model(model, data)
-    nll = model_nll(model, data)
-    print(f"nll: {nll}")
-    data_choice_samples = jax.vmap(model.exact_cond_sample)(data, jax.random.split(PRNGKey(0), len(data)))
+    #nll0 = model_nll(model, data)
+    #print(f"nll0: {nll0}")
+    model, data_choice_samples = fit_model(model, data, compare_exact=False)
+    #nll = model_nll(model, data)
+    #print(f"nll: {nll}")
+    #data_choice_samples = jax.vmap(model.exact_cond_sample)(data, jax.random.split(PRNGKey(0), len(data)))
     save_concepts(model, data_choice_samples, data, recon, model.dnode.embedding)
-    exit()
-    model_samples = sample_model(model, PRNGKey(5), len(data))
-    for digit in allowed_classes:
-        plot_projected(mnist_data, [data, model_samples], digit=digit)
 
 
 def main():
     train_on_mnist()
     exit()
     init_key = PRNGKey(1)
-    D = 1
-    C = D*10
+    D = 2
+    C = D*4
     N = 20
     dnode = DetNode.create(D, C, init_key)
     manual_embedding = jnp.array([one_hot(0,D), one_hot(0,D), one_hot(1,D), one_hot(1,D)]).T
@@ -467,12 +394,13 @@ def main():
     model2 = make_model(D+0, C+4, N, PRNGKey(6))
     test_samples = sample_model(model1, PRNGKey(5), 3)
     print("testing in distribution sampling...")
-    #for test_sample in test_samples:
-    #    test_sampling_at_x(model1, PRNGKey(5), test_sample)
+    for test_sample in test_samples:
+        test_sampling_at_x(model1, PRNGKey(5), test_sample)
     print("testing out of distribution sampling...")
-    #for test_sample in test_samples:
-    #    test_sampling_at_x(model2, PRNGKey(5), test_sample)
+    for test_sample in test_samples:
+        test_sampling_at_x(model2, PRNGKey(5), test_sample)
     print("done testing sampling...")
+    #exit()
     visualize_model_samples(model1, PRNGKey(5))
     #model1 = make_model(D, C, N, PRNGKey(4))
     #compare_models_at_samples_from1(model1, model2, PRNGKey(8), 10)
