@@ -291,7 +291,7 @@ def save_concepts(model, choices, z, recons, concept_embed, truncate=16, row_siz
     concept_ent = -jnp.log(concept_probs) * concept_probs
     sorted_indices = jnp.argsort(concept_ent, descending=True)[:truncate]
     # disable sorting
-    sorted_indices = jnp.arange(concept_ent.shape[0])[:truncate]
+    #sorted_indices = jnp.arange(concept_ent.shape[0])[:truncate]
     np.set_printoptions(precision=2, suppress=True)
     sorted_choices = choices[:, sorted_indices]
     sorted_probs = concept_probs[sorted_indices]
@@ -397,18 +397,28 @@ def train_on_mnist():
     COV = jnp.cov(data.T)
     print(f"covariance: {np.diag(COV)}")
     D = 2
-    C = 30
+    C = 20
     N = 20
     model = make_model(D, C, N, PRNGKey(4))
     #nll0 = model_nll(model, data)
     #print(f"nll0: {nll0}")
     model, data_choice_samples = fit_model(model, data, compare_exact=False)
+    extra_samples = 7
+    total_data_choice_samples = data_choice_samples.astype(jnp.float32)
+    for i in range(extra_samples):
+        data_choice_samples = model.monte_carlo_resample_cond(data, data_choice_samples, PRNGKey(i), N=30)
+        total_data_choice_samples = total_data_choice_samples + data_choice_samples.astype(jnp.float32)
+    avg_data_choice_samples = total_data_choice_samples / (extra_samples + 1)
+
     #nll = model_nll(model, data)
     #print(f"nll: {nll}")
     #data_choice_samples = jax.vmap(model.exact_cond_sample)(data, jax.random.split(PRNGKey(0), len(data)))
     fit_linear_probes(model, data_choice_samples, data, classes[keep], trainsize=10)
+    fit_linear_probes(model, avg_data_choice_samples, data, classes[keep], trainsize=10)
     fit_linear_probes(model, data_choice_samples, data, classes[keep], trainsize=100)
+    fit_linear_probes(model, avg_data_choice_samples, data, classes[keep], trainsize=100)
     fit_linear_probes(model, data_choice_samples, data, classes[keep], trainsize=1000)
+    fit_linear_probes(model, avg_data_choice_samples, data, classes[keep], trainsize=1000)
     save_concepts(model, data_choice_samples, data, recon, model.dnode.embedding)
 
 

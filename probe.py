@@ -70,7 +70,10 @@ class CountProbe(Probe):
 
     def fit(self, choices: Array, obs: Array) -> 'ChoiceProbe':
         counts = choices[..., None, :] * obs[...,:, None]
-        return self.replace(params=self.params + jnp.sum(counts, axis=0))
+        base_probs = jnp.ones_like(self.params)
+        base_probs = base_probs / self.params.shape[-1]
+        base_probs = base_probs * jnp.mean(jnp.sum(choices, axis=-1), axis=0)
+        return self.replace(params=base_probs + jnp.sum(counts, axis=0))
 
     def logits(self, hidden: Array) -> Array:
         out = hidden @ jnp.log(self.params.T)
