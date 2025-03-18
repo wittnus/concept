@@ -180,7 +180,9 @@ def fit_model(model, data, compare_exact=True):
     P = 10
     total_loss = 0.
     choices = model.monte_carlo_sample_cond(data, PRNGKey(0))
-    for i, subkey in enumerate(tqdm(jax.random.split(PRNGKey(0), 500))):
+    print_model_orthogonality(model)
+    total_steps = 300
+    for i, subkey in enumerate(tqdm(jax.random.split(PRNGKey(0), total_steps))):
         key1, key2 = jax.random.split(subkey)
         #if i % 10 == 0:
         #    choices = model.monte_carlo_sample_cond(data, key1)
@@ -191,15 +193,20 @@ def fit_model(model, data, compare_exact=True):
         total_loss += loss
         if i % P == P-1:
             to_print = f"loss: {total_loss/P:.3f}"
+            cluster_sizes = model.dnode.cluster_sizes()
+            to_print += f" cluster_sizes: {cluster_sizes}"
             if compare_exact:
                 exact_loss = model_nll(model, data)
                 exact_entropy = model_entropy(model, data)
                 to_print += f" (ent: {exact_entropy:.3f} exact: {exact_loss:.3f})"
             print(to_print)
+            print_model_orthogonality(model)
             total_loss = 0.
         model = model.cluster_var_observe(data, choices)
         #dnode = tree_map(lambda p, g: p - 1e-1 * g, model.dnode, grad.dnode).renormalize()
         dnode = model.dnode.observe(choices)
+        if i > 0.8*total_steps:
+            dnode = dnode.soft_orthogonalize()
         #dnode = dnode.orthogonalize()
         model = model.replace(dnode=dnode)
         model = model.lstsq_observe(data, choices)
@@ -214,6 +221,23 @@ def choose_for_concept(choices, concept_index, count=32, negate=False):
         _choices = choices
     indices = jax.random.categorical(key, jnp.log(_choices[:, concept_index]), shape=(count,))
     return indices
+
+def print_model_orthogonality(model):
+    orthogonality_deficit = model.dnode.orthogonality_deficit()
+    print(f"orthogonality_deficit: {orthogonality_deficit}")
+    return
+    embed = model.dnode.embedding
+    cov = embed.T @ embed
+    abscov = jnp.abs(cov)
+    eigvals = jnp.linalg.eigvalsh(cov)
+    abseigvals = jnp.linalg.eigvalsh(abscov)
+    abs2eigvals = jnp.linalg.eigvalsh(abscov @ abscov)
+    trace = jnp.trace(cov)
+    abstrace = jnp.trace(abscov)
+    abs2trace = jnp.trace(abscov @ abscov)
+    print(f"top 6 eigvals: {eigvals[-6:][::-1]}, trace: {trace}")
+    print(f"top 6 abseigvals: {abseigvals[-6:][::-1]}, abstrace: {abstrace}")
+    print(f"top 6 abs2eigvals: {abs2eigvals[-6:][::-1]}, abs2trace: {abs2trace}")
 
 def embed_covariance(embed):
     cov = embed.T @ embed

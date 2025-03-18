@@ -37,6 +37,27 @@ class DetNode:
         mask = (c_idx * self.D) // self.C == d_idx
         return DetNode(embedding=jnp.where(mask, self.embedding, 0.0)).renormalize()
 
+    def orthogonality_deficit(self) -> Array:
+        Cov = self.embedding.T @ self.embedding
+        Cov = jnp.abs(Cov)
+        Cov = Cov @ Cov
+        return jnp.sum(jnp.square(Cov)) - self.D
+
+    def soft_orthogonalize(self) -> "DetNode":
+        Cov = self.embedding.T @ self.embedding
+        Cov = jnp.abs(Cov)
+        #Cov = Cov @ Cov
+        Cov = Cov / jnp.diag(Cov)[..., None]
+        return DetNode(embedding=self.embedding @ Cov).renormalize()
+
+    def cluster_sizes(self) -> Array:
+        Cov = self.embedding.T @ self.embedding
+        Cov = jnp.abs(Cov)
+        root_diag = jnp.sqrt(jnp.diag(Cov))
+        Cov = Cov / root_diag[:, None] / root_diag[None, :]
+        eigvals = jnp.linalg.eigvalsh(Cov)
+        return eigvals[-self.D:]
+
     @property
     def D(self) -> int:
         return self.embedding.shape[0]
