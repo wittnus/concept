@@ -11,6 +11,7 @@ dependencies = [
     "etils>=1.12.0",
     "flax>=0.10.4",
     "jax>=0.5.1",
+    "jaxopt>=0.8.3",
     "matplotlib>=3.10.0",
     "optax>=0.2.4",
     "pandas>=2.2.3",

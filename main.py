@@ -19,6 +19,7 @@ import seaborn as sns
 import vae.utils as vae_utils
 import vae_lib as vae_lib
 from collections import namedtuple
+from probe import LogisticProbe, CountProbe
 
 from PIL import Image
 
@@ -181,7 +182,7 @@ def fit_model(model, data, compare_exact=True):
     total_loss = 0.
     choices = model.monte_carlo_sample_cond(data, PRNGKey(0))
     print_model_orthogonality(model)
-    total_steps = 300
+    total_steps = 600
     for i, subkey in enumerate(tqdm(jax.random.split(PRNGKey(0), total_steps))):
         key1, key2 = jax.random.split(subkey)
         #if i % 10 == 0:
@@ -206,6 +207,7 @@ def fit_model(model, data, compare_exact=True):
         #dnode = tree_map(lambda p, g: p - 1e-1 * g, model.dnode, grad.dnode).renormalize()
         dnode = model.dnode.observe(choices)
         if i > 0.8*total_steps:
+            pass
             dnode = dnode.soft_orthogonalize()
         #dnode = dnode.orthogonalize()
         model = model.replace(dnode=dnode)
@@ -357,12 +359,22 @@ def save_recon_and_resample(model, choices, z, steps, row_size):
     all_images = all_images.reshape(-1, 28, 28, 1)
     vae_utils.save_image(all_images, "results/recon_and_resample.png", nrow=row_size)
 
+def fit_linear_probes(model, choices, z, labels, trainsize=100):
+    obs = jax.nn.one_hot(labels, 10, axis=-1)
+    key = PRNGKey(0)
 
-
-
-
-
-
+    def do_probe(name, probe_type, key, hidden, obs, trainsize):
+        probe = probe_type.init(key, obs.shape[-1], hidden.shape[-1])
+        probe = probe.fit(hidden[:trainsize], obs[:trainsize])
+        train_loss = probe.batch_loss(hidden[:trainsize], obs[:trainsize])
+        train_acc = probe.batch_accuracy(hidden[:trainsize], obs[:trainsize])
+        test_loss = probe.batch_loss(hidden[trainsize:], obs[trainsize:])
+        test_acc = probe.batch_accuracy(hidden[trainsize:], obs[trainsize:])
+        print(f"[{name} {trainsize}] train: {100.0*train_acc:.1f}%, {train_loss:.3f}, test: {100.0*test_acc:.1f}%, {test_loss:.3f}")
+    
+    do_probe("linear", LogisticProbe, key, z, obs, trainsize)
+    do_probe("linear_choice", LogisticProbe, key, choices, obs, trainsize)
+    do_probe("count", CountProbe, key, choices, obs, trainsize)
 
 
 
@@ -384,8 +396,8 @@ def train_on_mnist():
     print(f"data count: {len(data)}")
     COV = jnp.cov(data.T)
     print(f"covariance: {np.diag(COV)}")
-    D = 4
-    C = 20
+    D = 2
+    C = 30
     N = 20
     model = make_model(D, C, N, PRNGKey(4))
     #nll0 = model_nll(model, data)
@@ -394,6 +406,9 @@ def train_on_mnist():
     #nll = model_nll(model, data)
     #print(f"nll: {nll}")
     #data_choice_samples = jax.vmap(model.exact_cond_sample)(data, jax.random.split(PRNGKey(0), len(data)))
+    fit_linear_probes(model, data_choice_samples, data, classes[keep], trainsize=10)
+    fit_linear_probes(model, data_choice_samples, data, classes[keep], trainsize=100)
+    fit_linear_probes(model, data_choice_samples, data, classes[keep], trainsize=1000)
     save_concepts(model, data_choice_samples, data, recon, model.dnode.embedding)
 
 
