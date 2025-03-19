@@ -444,15 +444,16 @@ class BetaLeaf:
         probe = self.probe - jax.lax.stop_gradient(self.probe)
         if prior is None:
             return lnprob_pos + lnprob_neg - self.partition() + probe
-        # remember probe
-        raise NotImplementedError
-        total = tree_map(jnp.add, self, prior)
-        return lnprob_pos + lnprob_neg - total.partition() + prior.partition()
+        else:
+            total = tree_map(jnp.add, self, prior)
+            return lnprob_pos + lnprob_neg - total.partition() + prior.partition() + probe
 
     def sample(self, key: PRNGKey) -> Array:
-        mean = self.alpha / (self.alpha + self.beta)
+        total = self
+        #total = tree_map(jnp.add, self, prior)
+        mean = total.alpha / (total.alpha + total.beta)
         #return mean
-        return jax.random.beta(key, self.alpha, self.beta)
+        return jax.random.beta(key, total.alpha, total.beta)
 
 
 @chex.dataclass
@@ -469,7 +470,8 @@ class BetaModel:
         return cls(dnode=dnode, prior=prior, leaves=leaves)
 
     def log_prob(self, pos: Array, neg: Array) -> Array:
-        leaves_log_prob = self.leaves.log_prob(pos[...,None,:], neg[...,None,:], None).sum(axis=-1)
+        prior_log_prob = self.prior.log_prob(pos, neg).sum(axis=-1)
+        leaves_log_prob = self.leaves.log_prob(pos[...,None,:], neg[...,None,:], self.prior).sum(axis=-1)
         #leaves_log_prob = jnp.clip(leaves_log_prob, -1e2, 1e2)
         #uniform = logsumexp(leaves_log_prob, axis=-1) - jnp.log(leaves_log_prob.shape[-1])
         #uniform = jnp.mean(leaves_log_prob, axis=-1)
@@ -477,7 +479,7 @@ class BetaModel:
         #leaves_log_prob = jax.lax.stop_gradient(leaves_log_prob)
         max_leaf_log_prob = jnp.max(leaves_log_prob, axis=-1)
         root_log_prob = self.dnode.log_prob_unnorm(leaves_log_prob - max_leaf_log_prob)
-        root_log_prob = root_log_prob + max_leaf_log_prob
+        root_log_prob = root_log_prob + max_leaf_log_prob + prior_log_prob
         return root_log_prob
         return root_log_prob + uniform
 
@@ -485,7 +487,11 @@ class BetaModel:
         key1, key2 = jax.random.split(key)
         choices, _ = self.dnode.sample(key1)
         jax.debug.print("choices: {}", jnp.argmax(choices))
-        pixels = self.leaves.sample(key2)
+        total_chosen = tree_map(lambda l: jnp.sum(l, axis=-2, where=choices[..., None]), self.leaves)
+        total_chosen = tree_map(jnp.add, total_chosen, self.prior)
+        pixels = total_chosen.sample(key2)
+        return pixels
+        pixels = self.leaves.sample(key2, prior=self.prior)
         chosen_pixels = jnp.einsum("...ij,...i->...j", pixels, choices)
         return chosen_pixels
 

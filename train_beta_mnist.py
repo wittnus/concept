@@ -3,6 +3,7 @@ import jax.numpy as jnp
 import numpy as np
 
 from jax.tree_util import tree_map
+from functools import partial
 from jax import random
 from jax.random import PRNGKey
 from einshape import jax_einshape as einshape
@@ -48,6 +49,11 @@ def train(model, mnist):
         dnode = tree_map(lambda p, g, lng: p - 1e-1 * (g+lng), dnode, grad.dnode, lngrad.dnode)
         dnode = dnode.renormalize()
         model = model.replace(dnode=dnode)
+
+        prior = model.prior
+        prior = tree_map(lambda p, g: p - 3e-2 * g, prior, grad.prior)
+        prior = prior.clamp()
+        model = model.replace(prior=prior)
         #model = model.replace(leaves=model.leaves.clamp())
         #print(model.alpha.reshape(SIZE, SIZE))
         #print(model.beta.reshape(SIZE, SIZE))
