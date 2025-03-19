@@ -4,8 +4,13 @@ from jax import numpy as jnp
 import chex
 from chex import Array
 from jax.random import PRNGKey
+from jax import random
 from typing import Tuple
 from itertools import combinations
+
+from jax.scipy.special import xlogy, xlog1py, gammaln, logsumexp, betaln
+from jax.tree_util import tree_map
+from typing import Tuple
 
 
 def reject(U: Array, v: Array) -> Array:
@@ -397,4 +402,90 @@ class Model:
         iroot = jnp.linalg.inv(root_cov)
         new_invbasis = iroot @ self.invbasis
         return Model(dnode=self.dnode, means=new_means, invbasis=new_invbasis)
+
+
+@chex.dataclass
+class BetaLeaf:
+    alpha: Array
+    beta: Array
+    probe: Array
+
+    @classmethod
+    def jeffreys(cls) -> "BetaLeaf":
+        return cls(alpha=0.5, beta=0.5, probe=0.0)
+
+    @classmethod
+    def uniform(cls) -> "BetaLeaf":
+        return cls(alpha=1.0, beta=1.0, probe=0.0)
+
+    @classmethod
+    def init(cls, key, shape=()):
+        key1, key2 = jax.random.split(key)
+        alpha = jax.random.exponential(key1, shape) + 1.
+        beta = jax.random.exponential(key2, shape) + 1.
+        #return cls(alpha=alpha, beta=beta)
+        return cls(alpha=alpha, beta=beta, probe=jnp.zeros(shape))
+
+    def clamp(self, minval: float = 1e-3, maxval: float = 1e3) -> "BetaLeaf":
+        alpha = jnp.clip(self.alpha, minval, maxval)
+        beta = jnp.clip(self.beta, minval, maxval)
+        #return BetaLeaf(alpha=alpha, beta=beta)
+        return BetaLeaf(alpha=alpha, beta=beta, probe=jnp.zeros_like(self.probe))
+
+    def partition(self) -> Array:
+        return betaln(self.alpha, self.beta)
+
+    def log_prob(self, pos, neg, prior: "BetaLeaf"=None) -> Array:
+        #return jax.scipy.stats.beta.logpdf(pos, self.alpha, self.beta)
+        lnprob_pos = xlog1py(self.alpha - 1, -neg)
+        #jax.debug.print("lnprob_pos: {}", jnp.isfinite(lnprob_pos).all())
+        lnprob_neg = xlog1py(self.beta - 1, -pos)
+        #jax.debug.print("lnprob_neg: {}", jnp.isfinite(lnprob_neg).all())
+        probe = self.probe - jax.lax.stop_gradient(self.probe)
+        if prior is None:
+            return lnprob_pos + lnprob_neg - self.partition() + probe
+        # remember probe
+        raise NotImplementedError
+        total = tree_map(jnp.add, self, prior)
+        return lnprob_pos + lnprob_neg - total.partition() + prior.partition()
+
+    def sample(self, key: PRNGKey) -> Array:
+        mean = self.alpha / (self.alpha + self.beta)
+        #return mean
+        return jax.random.beta(key, self.alpha, self.beta)
+
+
+@chex.dataclass
+class BetaModel:
+    dnode: DetNode
+    prior: BetaLeaf
+    leaves: BetaLeaf
+
+    @classmethod
+    def create_with_dnode(cls, dnode: DetNode, N: int, key: PRNGKey) -> "BetaModel":
+        leaves_shape = (dnode.C, N)
+        prior = BetaLeaf.jeffreys()
+        leaves = BetaLeaf.init(key, leaves_shape)
+        return cls(dnode=dnode, prior=prior, leaves=leaves)
+
+    def log_prob(self, pos: Array, neg: Array) -> Array:
+        leaves_log_prob = self.leaves.log_prob(pos[...,None,:], neg[...,None,:], None).sum(axis=-1)
+        #leaves_log_prob = jnp.clip(leaves_log_prob, -1e2, 1e2)
+        #uniform = logsumexp(leaves_log_prob, axis=-1) - jnp.log(leaves_log_prob.shape[-1])
+        #uniform = jnp.mean(leaves_log_prob, axis=-1)
+        #return uniform #+ 1e-1*jnp.mean(leaves_log_prob, axis=-1)
+        #leaves_log_prob = jax.lax.stop_gradient(leaves_log_prob)
+        max_leaf_log_prob = jnp.max(leaves_log_prob, axis=-1)
+        root_log_prob = self.dnode.log_prob_unnorm(leaves_log_prob - max_leaf_log_prob)
+        root_log_prob = root_log_prob + max_leaf_log_prob
+        return root_log_prob
+        return root_log_prob + uniform
+
+    def sample(self, key) -> Array:
+        key1, key2 = jax.random.split(key)
+        choices, _ = self.dnode.sample(key1)
+        jax.debug.print("choices: {}", jnp.argmax(choices))
+        pixels = self.leaves.sample(key2)
+        chosen_pixels = jnp.einsum("...ij,...i->...j", pixels, choices)
+        return chosen_pixels
 
