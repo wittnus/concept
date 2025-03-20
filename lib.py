@@ -8,7 +8,7 @@ from jax import random
 from typing import Tuple
 from itertools import combinations
 
-from jax.scipy.special import xlogy, xlog1py, gammaln, logsumexp, betaln
+from jax.scipy.special import xlogy, xlog1py, gammaln, logsumexp, betaln, polygamma
 from jax.tree_util import tree_map
 from typing import Tuple
 
@@ -55,6 +55,9 @@ class DetNode:
         Cov = Cov / jnp.diag(Cov)[..., None]
         return DetNode(embedding=self.embedding @ Cov).renormalize()
 
+    def marginal_probabilities(self) -> Array:
+        return jnp.einsum("...ij,...ij->...j", self.embedding, self.embedding)
+
     def cluster_sizes(self) -> Array:
         Cov = self.embedding.T @ self.embedding
         Cov = jnp.abs(Cov)
@@ -62,6 +65,14 @@ class DetNode:
         Cov = Cov / root_diag[:, None] / root_diag[None, :]
         eigvals = jnp.linalg.eigvalsh(Cov)
         return eigvals[-self.D:]
+
+    def cluster_compositions(self) -> Array:
+        Cov = self.embedding.T @ self.embedding
+        Cov = jnp.abs(Cov)
+        root_diag = jnp.sqrt(jnp.diag(Cov))
+        Cov = Cov / root_diag[:, None] / root_diag[None, :]
+        eigvals, eigvecs = jnp.linalg.eigh(Cov)
+        return jnp.square(eigvecs[:, -self.D:]).T
 
     @property
     def D(self) -> int:
@@ -426,7 +437,26 @@ class BetaLeaf:
         #return cls(alpha=alpha, beta=beta)
         return cls(alpha=alpha, beta=beta, probe=jnp.zeros(shape))
 
-    def clamp(self, minval: float = 1e-3, maxval: float = 1e3) -> "BetaLeaf":
+    @property
+    def mean(self) -> Array:
+        return self.alpha / (self.alpha + self.beta)
+
+    @property
+    def precision(self) -> Array:
+        return self.alpha + self.beta
+
+    @property
+    def fisher(self) -> Array:
+        trig_alpha = polygamma(2, self.alpha)
+        trig_beta = polygamma(2, self.beta)
+        trig_sum = polygamma(2, self.alpha + self.beta)
+        curv_alpha = trig_sum - trig_alpha
+        curv_beta = trig_sum - trig_beta
+        curv_probe = jnp.ones_like(self.probe)
+        return BetaLeaf(alpha=curv_alpha, beta=curv_beta, probe=curv_probe)
+
+
+    def clamp(self, minval: float = 0.5, maxval: float = 3e1) -> "BetaLeaf":
         alpha = jnp.clip(self.alpha, minval, maxval)
         beta = jnp.clip(self.beta, minval, maxval)
         #return BetaLeaf(alpha=alpha, beta=beta)
@@ -466,6 +496,7 @@ class BetaModel:
     def create_with_dnode(cls, dnode: DetNode, N: int, key: PRNGKey) -> "BetaModel":
         leaves_shape = (dnode.C, N)
         prior = BetaLeaf.jeffreys()
+        prior = tree_map(lambda p: jnp.broadcast_to(p, (N,)), prior)
         leaves = BetaLeaf.init(key, leaves_shape)
         return cls(dnode=dnode, prior=prior, leaves=leaves)
 

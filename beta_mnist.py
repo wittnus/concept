@@ -48,6 +48,18 @@ class Datum:
         reshape = partial(einshape, "...hwc->...(hwc)")
         return self.replace(image=reshape(self.image))
 
+    def shuffle(self, key: PRNGKey) -> 'Datum':
+        perm = random.permutation(key, self.image.shape[0])
+        return tree_map(operator.itemgetter(perm), self)
+
+    def pairs(self, key: PRNGKey, widthwise=True) -> 'Datum':
+        other = self.shuffle(key)
+        axis = -2 if widthwise else -3
+        merged_image = jnp.concatenate([self.image, other.image], axis=axis)
+        H, W = self.image.shape[-3], self.image.shape[-2]
+        resized = self.replace(image=merged_image).resize(H, W)
+        return resized
+
 
 def _load_mnist():
     key = PRNGKey(0)
@@ -57,8 +69,10 @@ def _load_mnist():
 
 def load_mnist(classes: Array=jnp.arange(10), height: int=28, width: int=28) -> Datum:
     mnist = _load_mnist()
-    mnist = mnist.resize(height, width)
     mnist = mnist.filter(classes)
+    mnist = mnist.pairs(PRNGKey(0), widthwise=True)
+    #mnist = mnist.pairs(PRNGKey(1), widthwise=False)
+    mnist = mnist.resize(height, width)
     mnist = mnist.flatten()
     return mnist
 
