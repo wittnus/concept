@@ -46,12 +46,12 @@ def train(model, mnist):
         #model = tree_map(lambda p, g: p - 1e-1 * g, model, grad)
         leaves = model.leaves
         scale = grad.leaves.probe
-        leaves = tree_map(lambda p, g, f: p - 1e-1 * g / (1e-32 + jnp.abs(scale*f)), leaves, grad.leaves, leaves.fisher)
+        leaves = tree_map(lambda p, g, f: p - 3e-1 * g / (1e-32 + jnp.abs(scale*f)), leaves, grad.leaves, leaves.fisher)
         leaves = leaves.clamp()
         model = model.replace(leaves=leaves)
         
         dnode = model.dnode
-        dnode = tree_map(lambda p, g, lng: p - 3e-2 * (g+lng), dnode, grad.dnode, lngrad.dnode)
+        dnode = tree_map(lambda p, g, lng: p - 3e-2 * g, dnode, grad.dnode, lngrad.dnode)
         dnode = dnode.renormalize()
         model = model.replace(dnode=dnode)
 
@@ -87,7 +87,7 @@ def show(model, mnist):
     print(jnp.max(model.leaves.precision))
     print(jnp.min(model.leaves.precision))
     print(jnp.mean(model.leaves.precision))
-    leaves_prec = jnp.log(model.leaves.precision[order]) / 2.
+    leaves_prec = jnp.log1p(model.leaves.precision[order]) / 2.
     leaves_prec = einshape("c(ss)->css1", leaves_prec, s=SIZE)
     together = jnp.concatenate([leaves_mean, leaves_prec], axis=0)
     vae_utils.save_image(together, "results/beta/leaves.png", nrow=len(together)//2)
@@ -102,7 +102,7 @@ def main():
     print(tree_map(jnp.shape, mnist))
 
     D = 2
-    C = 24
+    C = 48
     N = SIZE * SIZE
 
     dnode = DetNode.create(D=D, C=C, key=PRNGKey(0))

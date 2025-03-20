@@ -423,23 +423,24 @@ class BetaLeaf:
 
     @classmethod
     def jeffreys(cls) -> "BetaLeaf":
+        raise NotImplementedError
         return cls(alpha=0.5, beta=0.5, probe=0.0)
 
     @classmethod
     def uniform(cls) -> "BetaLeaf":
-        return cls(alpha=1.0, beta=1.0, probe=0.0)
+        return cls(alpha=0.0, beta=0.0, probe=0.0)
 
     @classmethod
     def init(cls, key, shape=()):
         key1, key2 = jax.random.split(key)
-        alpha = jax.random.exponential(key1, shape) + 1.
-        beta = jax.random.exponential(key2, shape) + 1.
+        alpha = jax.random.exponential(key1, shape)
+        beta = jax.random.exponential(key2, shape)
         #return cls(alpha=alpha, beta=beta)
         return cls(alpha=alpha, beta=beta, probe=jnp.zeros(shape))
 
     @property
     def mean(self) -> Array:
-        return self.alpha / (self.alpha + self.beta)
+        return (self.alpha + 1.) / (self.alpha + self.beta + 2.)
 
     @property
     def precision(self) -> Array:
@@ -447,29 +448,29 @@ class BetaLeaf:
 
     @property
     def fisher(self) -> Array:
-        trig_alpha = polygamma(2, self.alpha)
-        trig_beta = polygamma(2, self.beta)
-        trig_sum = polygamma(2, self.alpha + self.beta)
+        trig_alpha = polygamma(2, self.alpha + 1.)
+        trig_beta = polygamma(2, self.beta + 1.)
+        trig_sum = polygamma(2, self.alpha + self.beta + 2.)
         curv_alpha = trig_sum - trig_alpha
         curv_beta = trig_sum - trig_beta
         curv_probe = jnp.ones_like(self.probe)
         return BetaLeaf(alpha=curv_alpha, beta=curv_beta, probe=curv_probe)
 
 
-    def clamp(self, minval: float = 0.5, maxval: float = 3e1) -> "BetaLeaf":
+    def clamp(self, minval: float = 0.0, maxval: float = 3e1) -> "BetaLeaf":
         alpha = jnp.clip(self.alpha, minval, maxval)
         beta = jnp.clip(self.beta, minval, maxval)
         #return BetaLeaf(alpha=alpha, beta=beta)
         return BetaLeaf(alpha=alpha, beta=beta, probe=jnp.zeros_like(self.probe))
 
     def partition(self) -> Array:
-        return betaln(self.alpha, self.beta)
+        return betaln(self.alpha + 1., self.beta + 1.)
 
     def log_prob(self, pos, neg, prior: "BetaLeaf"=None) -> Array:
         #return jax.scipy.stats.beta.logpdf(pos, self.alpha, self.beta)
-        lnprob_pos = xlog1py(self.alpha - 1, -neg)
+        lnprob_pos = xlog1py(self.alpha, -neg)
         #jax.debug.print("lnprob_pos: {}", jnp.isfinite(lnprob_pos).all())
-        lnprob_neg = xlog1py(self.beta - 1, -pos)
+        lnprob_neg = xlog1py(self.beta, -pos)
         #jax.debug.print("lnprob_neg: {}", jnp.isfinite(lnprob_neg).all())
         probe = self.probe - jax.lax.stop_gradient(self.probe)
         if prior is None:
@@ -479,11 +480,7 @@ class BetaLeaf:
             return lnprob_pos + lnprob_neg - total.partition() + prior.partition() + probe
 
     def sample(self, key: PRNGKey) -> Array:
-        total = self
-        #total = tree_map(jnp.add, self, prior)
-        mean = total.alpha / (total.alpha + total.beta)
-        #return mean
-        return jax.random.beta(key, total.alpha, total.beta)
+        return jax.random.beta(key, self.alpha + 1., self.beta + 1.)
 
 
 @chex.dataclass
@@ -495,7 +492,7 @@ class BetaModel:
     @classmethod
     def create_with_dnode(cls, dnode: DetNode, N: int, key: PRNGKey) -> "BetaModel":
         leaves_shape = (dnode.C, N)
-        prior = BetaLeaf.jeffreys()
+        prior = BetaLeaf.uniform()
         prior = tree_map(lambda p: jnp.broadcast_to(p, (N,)), prior)
         leaves = BetaLeaf.init(key, leaves_shape)
         return cls(dnode=dnode, prior=prior, leaves=leaves)
@@ -509,7 +506,7 @@ class BetaModel:
         #return uniform #+ 1e-1*jnp.mean(leaves_log_prob, axis=-1)
         #leaves_log_prob = jax.lax.stop_gradient(leaves_log_prob)
         max_leaf_log_prob = jnp.max(leaves_log_prob, axis=-1)
-        root_log_prob = self.dnode.log_prob_unnorm(leaves_log_prob - max_leaf_log_prob)
+        root_log_prob = self.dnode.log_prob(leaves_log_prob - max_leaf_log_prob)
         root_log_prob = root_log_prob + max_leaf_log_prob + prior_log_prob
         return root_log_prob
         return root_log_prob + uniform
