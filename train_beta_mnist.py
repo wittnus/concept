@@ -7,9 +7,10 @@ from functools import partial
 from jax import random
 from jax.random import PRNGKey
 from einshape import jax_einshape as einshape
+import operator
 
 from beta_mnist import load_mnist
-from lib import DetNode, BetaModel, BetaLeaf
+from lib import DetNode, BetaModel, BetaLeaf, GaussLeaf
 import vae.utils as vae_utils
 
 def dnode_probs(dnode):
@@ -22,10 +23,19 @@ def train(model, mnist):
     pixel_count = mnist.image.shape[-1]
     @jax.value_and_grad
     @jax.jit
-    def loss_and_grad(model, mnist):
+    def loss_and_grad(model, mnist, key):
         zero_image = jnp.zeros(pixel_count)
         lnprobs = jax.vmap(model.log_prob)(mnist.pos, mnist.neg)
-        return -jnp.mean(lnprobs)
+        #partitions = jax.vmap(model.posterior_partition)(mnist.pos, mnist.neg, random.split(key, len(mnist.pos)))
+        #entropies = jax.vmap(model.stochastic_entropy)(random.split(key, 1000))
+        lnprobs = lnprobs #- partitions
+        return -jnp.mean(lnprobs) #- jnp.mean(entropies)
+
+    @jax.value_and_grad
+    @jax.jit
+    def entropy_loss_grad(model, key):
+        entropies = jax.vmap(model.stochastic_entropy)(random.split(key, 100))
+        return jnp.mean(entropies)
 
     @jax.grad
     @jax.jit
@@ -39,24 +49,33 @@ def train(model, mnist):
     ))
     model = model.replace(dnode=model.dnode.renormalize())
     model = model.replace(leaves=model.leaves.clamp())
-    for i in range(20):
-        loss, grad = loss_and_grad(model, mnist)
-        lngrad = gradlognormalizer(model)
-        print(f'iter {i}, pixel loss {loss/ pixel_count:.4f}, {model.dnode.cluster_sizes()}')
+    BATCH_SIZE = 3000
+    def get_batch(mnist, key):
+        perm = random.permutation(key, len(mnist.image))
+        indices = perm[:BATCH_SIZE]
+        return tree_map(operator.itemgetter(indices), mnist)
+    for i in range(50):
+        key = PRNGKey(i)
+        batch = get_batch(mnist, key)
+        loss, grad = loss_and_grad(model, batch, key)
+        #ent, egrad = entropy_loss_grad(model, key)
+        #lngrad = gradlognormalizer(model)
+        print(f'iter {i}, pixel loss {(loss)/ pixel_count:.4f}, {model.dnode.cluster_sizes()}')
         #model = tree_map(lambda p, g: p - 1e-1 * g, model, grad)
         leaves = model.leaves
         scale = grad.leaves.probe
-        leaves = tree_map(lambda p, g, f: p - 3e-1 * g / (1e-32 + jnp.abs(scale*f)), leaves, grad.leaves, leaves.fisher)
+        leaves = tree_map(lambda p, g, f: p - 1e-1 * (g) / (1e-32 + jnp.abs(scale*f)), leaves, grad.leaves, leaves.fisher)
         leaves = leaves.clamp()
         model = model.replace(leaves=leaves)
         
-        dnode = model.dnode
-        dnode = tree_map(lambda p, g, lng: p - 3e-2 * g, dnode, grad.dnode, lngrad.dnode)
-        dnode = dnode.renormalize()
-        model = model.replace(dnode=dnode)
+        #dnode = model.dnode
+        #dnode = tree_map(lambda p, g, lng: p - 3e-2 * g, dnode, grad.dnode, lngrad.dnode)
+        #dnode = dnode.renormalize()
+        #model = model.replace(dnode=dnode)
+        model = model.dnode_observe(batch.pos, batch.neg)
 
         prior = model.prior
-        prior = tree_map(lambda p, g, f: p - 1e-1 * g / (1e-8 + jnp.abs(f)), prior, grad.prior, prior.fisher)
+        prior = tree_map(lambda p, g, f: p - 1e-1 * (g) / (1e-8 + jnp.abs(f)), prior, grad.prior, prior.fisher)
         prior = prior.clamp()
         model = model.replace(prior=prior)
     print(model.dnode.cluster_compositions())
@@ -94,7 +113,7 @@ def show(model, mnist):
 
 
 CLASSES = jnp.arange(10)
-SIZE = 16
+SIZE = 24
 def main():
     jnp.set_printoptions(precision=2, suppress=True)
     mnist = load_mnist(classes=CLASSES, height=SIZE, width=SIZE)
@@ -102,11 +121,13 @@ def main():
     print(tree_map(jnp.shape, mnist))
 
     D = 2
-    C = 48
+    C = 24
     N = SIZE * SIZE
 
     dnode = DetNode.create(D=D, C=C, key=PRNGKey(0))
-    model = BetaModel.create_with_dnode(dnode, N=N, key=PRNGKey(1))
+    #leaftype = BetaLeaf
+    leaftype = GaussLeaf
+    model = BetaModel.create_with_dnode(dnode, N=N, key=PRNGKey(1), leaftype=leaftype)
     #model = BetaLeaf.init(key=PRNGKey(2), shape=(N,))
     #show(model, mnist)
     model = train(model, mnist)
