@@ -27,13 +27,13 @@ class Datum:
         images = images.astype(jnp.float32) / 258.0
         return cls(image=images, label=labels)
 
-    @property
-    def pos(self) -> Array:
-        return self.image
+    #@property
+    #def pos(self) -> Array:
+    #    return self.image
 
-    @property
-    def neg(self) -> Array:
-        return 1 - self.image
+    #@property
+    #def neg(self) -> Array:
+    #    return 1 - self.image
 
     def filter(self, classes: Array) -> 'Datum':
         mask = jnp.isin(self.label, classes)

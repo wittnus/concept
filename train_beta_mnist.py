@@ -25,7 +25,7 @@ def train(model, mnist):
     @jax.jit
     def loss_and_grad(model, mnist, key):
         zero_image = jnp.zeros(pixel_count)
-        lnprobs = jax.vmap(model.log_prob)(mnist.pos, mnist.neg)
+        lnprobs = jax.vmap(model.log_prob_x)(mnist.image)
         #partitions = jax.vmap(model.posterior_partition)(mnist.pos, mnist.neg, random.split(key, len(mnist.pos)))
         #entropies = jax.vmap(model.stochastic_entropy)(random.split(key, 1000))
         lnprobs = lnprobs #- partitions
@@ -72,7 +72,7 @@ def train(model, mnist):
         #dnode = tree_map(lambda p, g, lng: p - 3e-2 * g, dnode, grad.dnode, lngrad.dnode)
         #dnode = dnode.renormalize()
         #model = model.replace(dnode=dnode)
-        model = model.dnode_observe(batch.pos, batch.neg)
+        model = model.dnode_observe_x(batch.image)
 
         prior = model.prior
         prior = tree_map(lambda p, g, f: p - 1e-1 * (g) / (1e-8 + jnp.abs(f)), prior, grad.prior, prior.fisher)
@@ -125,8 +125,8 @@ def main():
     N = SIZE * SIZE
 
     dnode = DetNode.create(D=D, C=C, key=PRNGKey(0))
-    #leaftype = BetaLeaf
-    leaftype = GaussLeaf
+    leaftype = BetaLeaf
+    #leaftype = GaussLeaf
     model = BetaModel.create_with_dnode(dnode, N=N, key=PRNGKey(1), leaftype=leaftype)
     #model = BetaLeaf.init(key=PRNGKey(2), shape=(N,))
     #show(model, mnist)

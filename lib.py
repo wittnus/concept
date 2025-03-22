@@ -419,43 +419,86 @@ class Model:
         new_invbasis = iroot @ self.invbasis
         return Model(dnode=self.dnode, means=new_means, invbasis=new_invbasis)
 
+
 @chex.dataclass
 class Leaf:
-    pass
+    probe: Array # for computing observation counts
+
+    @classmethod
+    def default(cls, shape=()) -> "Leaf":
+        return cls(probe=jnp.zeros(shape))
+
+    @classmethod
+    def init(cls, key, shape=()) -> "Leaf":
+        return cls.default(shape=shape)
+
+    @classmethod
+    def sufficient_statistics(cls, x: Array) -> Tuple[Array, Array]:
+        raise NotImplementedError
+
+    def clamp(self, minval: float = 0.0, maxval: float = 1.0) -> "Leaf":
+        return self
+
+    def mean(self) -> Array:
+        raise NotImplementedError
+
+    def fisher(self) -> "Leaf":
+        """i.e. variance of sufficient statistics"""
+        raise NotImplementedError
+
+    def partition(self) -> Array:
+        raise NotImplementedError
+
+    def log_prob(self, *t, prior: "Leaf"=None) -> Array:
+        """log density as function of natural statistic"""
+        probe = self.probe - jax.lax.stop_gradient(self.probe)
+        if prior is None:
+            return self._log_prob(*t) - self.partition() + probe
+        else:
+            total = tree_map(jnp.add, self, prior)
+            return self._log_prob(*t) - total.partition() + prior.partition() + probe
+
+    def sample(self, key: PRNGKey) -> Array:
+        raise NotImplementedError
+
+
 
 @chex.dataclass
 class BetaLeaf(Leaf):
     alpha: Array
     beta: Array
-    probe: Array
 
     @classmethod
-    def jeffreys(cls) -> "BetaLeaf":
-        raise NotImplementedError
-        return cls(alpha=0.5, beta=0.5, probe=0.0)
-
-    @classmethod
-    def uniform(cls) -> "BetaLeaf":
-        return cls(alpha=0.0, beta=0.0, probe=0.0)
-
-    @classmethod
-    def default(cls) -> "BetaLeaf":
-        return cls.uniform()
+    def default(cls, shape=()) -> "BetaLeaf":
+        return cls(probe=jnp.zeros(shape), alpha=jnp.zeros(shape), beta=jnp.zeros(shape))
 
     @classmethod
     def init(cls, key, shape=()):
         key1, key2 = jax.random.split(key)
         alpha = jax.random.exponential(key1, shape) / 10.
         beta = jax.random.exponential(key2, shape) / 10.
-        #return cls(alpha=alpha, beta=beta)
-        return cls(alpha=alpha, beta=beta, probe=jnp.zeros(shape))
+        return cls.default(shape=shape).replace(alpha=alpha, beta=beta)
+
+    @classmethod
+    def sufficient_statistics(cls, x: Array) -> Tuple[Array, Array]:
+        x = jnp.clip(x, 1e-3, 1. - 1e-3)
+        return jnp.log(x), jnp.log1p(-x)
 
     @property
     def mean(self) -> Array:
+        """measure of central tendency for display purposes"""
         return (self.alpha + 1.) / (self.alpha + self.beta + 2.)
 
     @property
+    def expectation(self) -> "BetaLeaf":
+        """expectation of sufficient statistics"""
+        exp_lnx = digamma(self.alpha + 1.) - digamma(self.alpha + self.beta + 2.)
+        exp_ln1mx = digamma(self.beta + 1.) - digamma(self.alpha + self.beta + 2.)
+        return BetaLeaf(alpha=exp_lnx, beta=exp_ln1mx, probe=jnp.zeros_like(self.probe))
+
+    @property
     def precision(self) -> Array:
+        """measure of spread for display purposes"""
         return self.alpha + self.beta
 
     @property
@@ -478,11 +521,13 @@ class BetaLeaf(Leaf):
     def partition(self) -> Array:
         return betaln(self.alpha + 1., self.beta + 1.)
 
-    def log_prob(self, pos, neg, prior: "BetaLeaf"=None) -> Array:
+    def _log_prob(self, lnx, ln1mx) -> Array:
+        return self.alpha * lnx + self.beta * ln1mx
         #return jax.scipy.stats.beta.logpdf(pos, self.alpha, self.beta)
-        lnprob_pos = xlog1py(self.alpha, -neg)
+        lnprob_pos = self.alpha * lnx + self.beta * ln1mx
+        #lnprob_pos = xlog1py(self.alpha, -neg)
         #jax.debug.print("lnprob_pos: {}", jnp.isfinite(lnprob_pos).all())
-        lnprob_neg = xlog1py(self.beta, -pos)
+        #lnprob_neg = xlog1py(self.beta, -pos)
         #jax.debug.print("lnprob_neg: {}", jnp.isfinite(lnprob_neg).all())
         probe = self.probe - jax.lax.stop_gradient(self.probe)
         #return lnprob_pos + lnprob_neg + probe
@@ -521,6 +566,10 @@ class GaussLeaf(Leaf):
         precision = jax.random.exponential(key2, shape)
         return cls(location=location, precision=precision, probe=jnp.zeros(shape))
 
+    @classmethod
+    def sufficient_statistics(cls, x: Array) -> Tuple[Array, Array]:
+        return x, x**2
+
     @property
     def mean(self) -> Array:
         return self.location / (self.precision + 1e-3)
@@ -539,7 +588,8 @@ class GaussLeaf(Leaf):
         return -0.5 * jnp.log(jnp.pi * self.precision) + 0.25 * self.location**2 / (self.precision + 1e-3)
 
 
-    def log_prob(self, pos: Array, neg: Array, prior: "GaussLeaf"=None) -> Array:
+    def _log_prob(self, x: Array, xsq: Array, prior: "GaussLeaf"=None) -> Array:
+        return self.location * x - self.precision * xsq
         probe = self.probe - jax.lax.stop_gradient(self.probe)
         lnprob = -self.precision * pos**2 + self.location * pos + probe
         if prior is None:
@@ -571,25 +621,23 @@ class BetaModel:
         #leaves = GaussLeaf.init(key, leaves_shape)
         return cls(dnode=dnode, prior=prior, leaves=leaves)
 
-    def log_prob(self, pos: Array, neg: Array) -> Array:
-        prior_log_prob = self.prior.log_prob(pos, neg).sum(axis=-1)
-        leaves_log_prob = self.leaves.log_prob(pos[...,None,:], neg[...,None,:], self.prior).sum(axis=-1)
-        #leaves_log_prob = jnp.clip(leaves_log_prob, -1e2, 1e2)
-        uniform = logsumexp(leaves_log_prob, axis=-1) - jnp.log(leaves_log_prob.shape[-1])
-        #return uniform + prior_log_prob
-        #uniform = jnp.mean(leaves_log_prob, axis=-1)
-        #return uniform #+ 1e-1*jnp.mean(leaves_log_prob, axis=-1)
-        #leaves_log_prob = jax.lax.stop_gradient(leaves_log_prob)
+    def log_prob(self, *t) -> Array:
+        prior_log_prob = self.prior.log_prob(*t).sum(axis=-1)
+        extended_ts = list(map(lambda a: a[..., None, :], t))
+        leaves_log_prob = self.leaves.log_prob(*extended_ts, prior=self.prior).sum(axis=-1)
+        #uniform = logsumexp(leaves_log_prob, axis=-1) - jnp.log(leaves_log_prob.shape[-1])
         max_leaf_log_prob = jnp.max(leaves_log_prob, axis=-1)
         root_log_prob = self.dnode.log_prob(leaves_log_prob - max_leaf_log_prob)
         root_log_prob = root_log_prob + max_leaf_log_prob + prior_log_prob
         return root_log_prob
-        return root_log_prob + uniform
+
+    def log_prob_x(self, x: Array) -> Array:
+        t = self.leaves.sufficient_statistics(x)
+        return self.log_prob(*t)
 
     def sample(self, key, dist=False) -> Array:
         key1, key2 = jax.random.split(key)
         choices, _ = self.dnode.sample(key1)
-        #jax.debug.print("choices: {}", jnp.argmax(choices))
         total_chosen = tree_map(lambda l: jnp.sum(l, axis=-2, where=choices[..., None]), self.leaves)
         total_chosen = tree_map(jnp.add, total_chosen, self.prior)
         if dist:
@@ -632,8 +680,10 @@ class BetaModel:
         return self.posterior_cond(pos, neg, key).partition().sum(axis=-1)
 
     @jax.jit
-    def dnode_observe(self, pos: Array, neg: Array) -> "BetaModel":
-        leaves_log_prob = self.leaves.log_prob(pos[...,None,:], neg[...,None,:], self.prior).sum(axis=-1)
+    def dnode_observe_x(self, x: Array) -> "BetaModel":
+        t = self.leaves.sufficient_statistics(x)
+        extended_ts = list(map(lambda a: a[..., None, :], t))
+        leaves_log_prob = self.leaves.log_prob(*extended_ts, prior=self.prior).sum(axis=-1)
         leaves_log_prob = leaves_log_prob - jnp.max(leaves_log_prob, axis=-1, keepdims=True)
         leaf_probs = jax.vmap(jax.grad(self.dnode.log_prob_unnorm))(leaves_log_prob)
         dnode = self.dnode.observe(leaf_probs, float_obs=True)
