@@ -721,6 +721,14 @@ class BetaModel:
         diff = individual[None, :] + individual[:, None] - cross
         return diff
 
+    def cointerference_matrix(self) -> Array:
+        total_leaves = tree_map(jnp.add, self.leaves, self.prior)
+        cross_totals = tree_map(lambda a, b, p: a[:,None,:] + b[None,:,:] + p, self.leaves, self.leaves, self.prior)
+        individual = -(self.prior.partition() - self.prior._semi_partition() - total_leaves.partition() + total_leaves._semi_partition()).sum(axis=-1)
+        cross = -(self.prior.partition() - self.prior._semi_partition() - cross_totals.partition() + cross_totals._semi_partition()).sum(axis=-1)
+        diff = individual[None, :] + individual[:, None] - cross
+        return diff
+
     def _intractability(self, cpm):
         cpm.at[jnp.diag_indices(cpm.shape[-1])].set(0.0)
         cpm = jax.lax.stop_gradient(cpm)

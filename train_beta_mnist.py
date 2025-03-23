@@ -81,9 +81,25 @@ def show(model, mnist):
     together = jnp.concatenate([leaves_mean, leaves_prec], axis=0)
     vae_utils.save_image(together, "results/beta/leaves.png", nrow=len(together)//2)
 
+def analyze_interference(model, mnist):
+    M = model.interference_matrix()
+    #print(np.array(M))
+    eigvals, eigvecs = np.linalg.eigh(M)
+    for i in range(-1, -4, -1):
+        print(f"eigval {i}: {eigvals[i]}")
+        print(f"eigvec {i}: {eigvecs[:,i]}")
+        print(f"subset: {np.nonzero(eigvecs[:,i] > 0.)}")
+    U = model.cointerference_matrix()
+    #print(np.array(U))
+    eigvals, eigvecs = np.linalg.eigh(U)
+    for i in range(-1, -4, -1):
+        print(f"eigval {i}: {eigvals[i]}")
+        print(f"eigvec {i}: {eigvecs[:,i]}")
+        print(f"subset: {np.nonzero(eigvecs[:,i] > 0.)}")
+
 
 CLASSES = jnp.arange(5)
-SIZE = 28
+SIZE = 20
 PIXEL_SPACE = True
 
 if not PIXEL_SPACE:
@@ -105,7 +121,7 @@ def main():
     print(tree_map(jnp.shape, mnist))
 
     D = 2
-    C = 12
+    C = 20
 
     dnode = DetNode.create(D=D, C=C, key=PRNGKey(0))
     leaftype = BetaLeaf
@@ -120,6 +136,8 @@ def main():
 
     model = train(model, mnist)
     show(model, mnist)
+    analyze_interference(model, mnist)
+    exit()
 
 if __name__ == '__main__':
     main()
