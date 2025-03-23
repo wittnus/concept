@@ -30,6 +30,10 @@ class DetNode:
         embedding = jax.random.normal(key, (D, C))
         return cls(embedding=embedding).renormalize()
 
+    def make_uniform(self) -> "DetNode":
+        embedding = self.embedding / jnp.linalg.norm(self.embedding, axis=-2, keepdims=True)
+        return self.replace(embedding=embedding).renormalize()
+
     def renormalize(self) -> "DetNode":
         M = self.embedding @ self.embedding.T
         invroot = jnp.linalg.inv(jnp.linalg.cholesky(M))
@@ -439,12 +443,20 @@ class Leaf:
     def clamp(self, minval: float = 0.0, maxval: float = 1.0) -> "Leaf":
         return self
 
+    @property
     def mean(self) -> Array:
         raise NotImplementedError
 
+    @property
     def fisher(self) -> "Leaf":
         """i.e. variance of sufficient statistics"""
         raise NotImplementedError
+
+    def newton_step(self, grad: "Leaf", lr=1e-1) -> "Leaf":
+        count = grad.probe
+        def update(param, grad, fisher):
+            return param - lr * grad / (1e-32 + jnp.abs(count * fisher))
+        return tree_map(update, self, grad, self.fisher).clamp()
 
     def partition(self) -> Array:
         raise NotImplementedError
@@ -515,7 +527,6 @@ class BetaLeaf(Leaf):
     def clamp(self, minval: float = 0.0, maxval: float = 3e1) -> "BetaLeaf":
         alpha = jnp.clip(self.alpha, minval, maxval)
         beta = jnp.clip(self.beta, minval, maxval)
-        #return BetaLeaf(alpha=alpha, beta=beta)
         return BetaLeaf(alpha=alpha, beta=beta, probe=jnp.zeros_like(self.probe))
 
     def partition(self) -> Array:
@@ -523,23 +534,9 @@ class BetaLeaf(Leaf):
 
     def _log_prob(self, lnx, ln1mx) -> Array:
         return self.alpha * lnx + self.beta * ln1mx
-        #return jax.scipy.stats.beta.logpdf(pos, self.alpha, self.beta)
-        lnprob_pos = self.alpha * lnx + self.beta * ln1mx
-        #lnprob_pos = xlog1py(self.alpha, -neg)
-        #jax.debug.print("lnprob_pos: {}", jnp.isfinite(lnprob_pos).all())
-        #lnprob_neg = xlog1py(self.beta, -pos)
-        #jax.debug.print("lnprob_neg: {}", jnp.isfinite(lnprob_neg).all())
-        probe = self.probe - jax.lax.stop_gradient(self.probe)
-        #return lnprob_pos + lnprob_neg + probe
-        if prior is None:
-            return lnprob_pos + lnprob_neg - self.partition() + probe
-        else:
-            total = tree_map(jnp.add, self, prior)
-            return lnprob_pos + lnprob_neg - total.partition() + prior.partition() + probe
 
     def expected_log_prob_unnorm(self, other: "BetaLeaf") -> Array:
         return (self.alpha)*digamma(other.alpha + 1) + (self.beta)*digamma(other.beta + 1) - (self.alpha + self.beta)*digamma(other.alpha + other.beta + 2)
-
 
     def sample(self, key: PRNGKey) -> Array:
         return jax.random.beta(key, self.alpha + 1., self.beta + 1.)
@@ -552,12 +549,12 @@ class GaussLeaf(Leaf):
     probe: Array
 
     @classmethod
-    def unit(cls) -> "GaussLeaf":
-        return cls(location = 0.0, precision = 1.0, probe = 0.0)
+    def unit(cls, shape=()) -> "GaussLeaf":
+        return cls(location=jnp.zeros(shape), precision=jnp.ones(shape), probe=jnp.zeros(shape))
 
     @classmethod
-    def default(cls) -> "GaussLeaf":
-        return cls.unit()
+    def default(cls, shape=()) -> "GaussLeaf":
+        return cls.unit(shape=shape)
 
     @classmethod
     def init(cls, key, shape=()):
@@ -587,7 +584,6 @@ class GaussLeaf(Leaf):
     def partition(self) -> Array:
         return -0.5 * jnp.log(jnp.pi * self.precision) + 0.25 * self.location**2 / (self.precision + 1e-3)
 
-
     def _log_prob(self, x: Array, xsq: Array, prior: "GaussLeaf"=None) -> Array:
         return self.location * x - self.precision * xsq
         probe = self.probe - jax.lax.stop_gradient(self.probe)
@@ -613,18 +609,19 @@ class BetaModel:
 
     @classmethod
     def create_with_dnode(cls, dnode: DetNode, N: int, key: PRNGKey, leaftype=BetaLeaf) -> "BetaModel":
-        leaves_shape = (dnode.C, N)
-        prior = leaftype.default()
-        #prior = GaussLeaf.unit()
-        prior = tree_map(lambda p: jnp.broadcast_to(p, (N,)), prior)
-        leaves = leaftype.init(key, leaves_shape)
-        #leaves = GaussLeaf.init(key, leaves_shape)
-        return cls(dnode=dnode, prior=prior, leaves=leaves)
+        return cls(
+            dnode=dnode.make_uniform(),
+            prior=leaftype.default((N,)),
+            leaves=leaftype.init(key, (dnode.C, N)).clamp()
+        )
+
+    def leaf_log_probs(self, *t) -> Array:
+        extended_ts = list(map(lambda a: a[..., None, :], t))
+        return self.leaves.log_prob(*extended_ts, prior=self.prior).sum(axis=-1)
 
     def log_prob(self, *t) -> Array:
         prior_log_prob = self.prior.log_prob(*t).sum(axis=-1)
-        extended_ts = list(map(lambda a: a[..., None, :], t))
-        leaves_log_prob = self.leaves.log_prob(*extended_ts, prior=self.prior).sum(axis=-1)
+        leaves_log_prob = self.leaf_log_probs(*t)
         #uniform = logsumexp(leaves_log_prob, axis=-1) - jnp.log(leaves_log_prob.shape[-1])
         max_leaf_log_prob = jnp.max(leaves_log_prob, axis=-1)
         root_log_prob = self.dnode.log_prob(leaves_log_prob - max_leaf_log_prob)
@@ -632,58 +629,18 @@ class BetaModel:
         return root_log_prob
 
     def log_prob_x(self, x: Array) -> Array:
-        t = self.leaves.sufficient_statistics(x)
-        return self.log_prob(*t)
+        return self.log_prob(*self.leaves.sufficient_statistics(x))
 
     def sample(self, key, dist=False) -> Array:
         key1, key2 = jax.random.split(key)
         choices, _ = self.dnode.sample(key1)
         total_chosen = tree_map(lambda l: jnp.sum(l, axis=-2, where=choices[..., None]), self.leaves)
         total_chosen = tree_map(jnp.add, total_chosen, self.prior)
-        if dist:
-            return total_chosen
-        pixels = total_chosen.sample(key2)
-        return pixels
-        pixels = self.leaves.sample(key2, prior=self.prior)
-        chosen_pixels = jnp.einsum("...ij,...i->...j", pixels, choices)
-        return chosen_pixels
-
-    def stochastic_entropy(self, key) -> Array:
-        #sample = self.sample(key, dist=True)
-        sample = self.sample(key, dist=False)
-        sample = jax.lax.stop_gradient(sample)
-        sample = jnp.clip(1e-2, 1. - 1e-2, sample)
-        pos = sample
-        neg = 1. - sample
-        #leaves_log_prob = self.leaves.expected_log_prob_unnorm(sample).sum(axis=-1)
-        leaves_log_prob = self.leaves.log_prob(pos[...,None,:], neg[...,None,:], self.prior).sum(axis=-1)
-        max_leaf_log_prob = jnp.max(leaves_log_prob, axis=-1)
-        root_log_prob = self.dnode.log_prob(leaves_log_prob - max_leaf_log_prob)
-        root_log_prob = root_log_prob + max_leaf_log_prob
-        return -root_log_prob
-    
-    def posterior_cond(self, pos: Array, neg: Array, key: PRNGKey) -> BetaLeaf:
-        leaves_log_prob = self.leaves.log_prob(pos[...,None,:], neg[...,None,:], self.prior).sum(axis=-1)
-        leaves_log_prob = leaves_log_prob - jnp.max(leaves_log_prob, axis=-1, keepdims=True)
-        #cond_dnode = jax.lax.stop_gradient(self.dnode).condition(leaves_log_prob, eps=0e-3)
-        #probs = cond_dnode.marginal_probabilities()
-        probs = jax.grad(self.dnode.log_prob_unnorm)(leaves_log_prob)
-        probs = jax.lax.stop_gradient(probs)
-        #probs = jax.nn.softmax(leaves_log_prob + jnp.log(self.dnode.marginal_probabilities()), axis=-1)
-        #probs = self.dnode.condition(leaves_log_prob, eps=1e-3).sample(key)[0]
-        #total_chosen = tree_map(lambda l: jnp.sum(l, axis=-2, where=probs[...,None]), self.leaves)
-        total_chosen = tree_map(lambda l: jnp.sum(l*probs[...,None], axis=-2), self.leaves)
-        total_chosen = tree_map(jnp.add, total_chosen, self.prior)
         return total_chosen
-
-    def posterior_partition(self, pos: Array, neg: Array, key: PRNGKey) -> Array:
-        return self.posterior_cond(pos, neg, key).partition().sum(axis=-1)
 
     @jax.jit
     def dnode_observe_x(self, x: Array) -> "BetaModel":
-        t = self.leaves.sufficient_statistics(x)
-        extended_ts = list(map(lambda a: a[..., None, :], t))
-        leaves_log_prob = self.leaves.log_prob(*extended_ts, prior=self.prior).sum(axis=-1)
+        leaves_log_prob = self.leaf_log_probs(*self.leaves.sufficient_statistics(x))
         leaves_log_prob = leaves_log_prob - jnp.max(leaves_log_prob, axis=-1, keepdims=True)
         leaf_probs = jax.vmap(jax.grad(self.dnode.log_prob_unnorm))(leaves_log_prob)
         dnode = self.dnode.observe(leaf_probs, float_obs=True)

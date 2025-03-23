@@ -9,127 +9,87 @@ from jax.random import PRNGKey
 from einshape import jax_einshape as einshape
 import operator
 
-from beta_mnist import load_mnist
+from beta_mnist import load_mnist, load_encoded_mnist, load_vae_model, vae_decode
 from lib import DetNode, BetaModel, BetaLeaf, GaussLeaf
 import vae.utils as vae_utils
 
-def dnode_probs(dnode):
-    embedding = dnode.embedding
-    probs = jnp.sum(embedding**2, axis=0)
-    return probs
-
+@jax.value_and_grad
+@jax.jit
+def loss_and_grad(model, mnist, key):
+    lnprobs = jax.vmap(model.log_prob_x)(mnist.x)
+    return -jnp.mean(lnprobs)
 
 def train(model, mnist):
-    pixel_count = mnist.image.shape[-1]
-    @jax.value_and_grad
-    @jax.jit
-    def loss_and_grad(model, mnist, key):
-        zero_image = jnp.zeros(pixel_count)
-        lnprobs = jax.vmap(model.log_prob_x)(mnist.image)
-        #partitions = jax.vmap(model.posterior_partition)(mnist.pos, mnist.neg, random.split(key, len(mnist.pos)))
-        #entropies = jax.vmap(model.stochastic_entropy)(random.split(key, 1000))
-        lnprobs = lnprobs #- partitions
-        return -jnp.mean(lnprobs) #- jnp.mean(entropies)
+    pixel_count = mnist.x.shape[-1]
 
-    @jax.value_and_grad
-    @jax.jit
-    def entropy_loss_grad(model, key):
-        entropies = jax.vmap(model.stochastic_entropy)(random.split(key, 100))
-        return jnp.mean(entropies)
-
-    @jax.grad
-    @jax.jit
-    def gradlognormalizer(model):
-        zero_image = jnp.zeros(pixel_count)
-        lognormalizer = model.log_prob(zero_image, zero_image)
-        return lognormalizer
-
-    model = model.replace(dnode=model.dnode.replace(
-        embedding=model.dnode.embedding / jnp.linalg.norm(model.dnode.embedding, axis=0, keepdims=True)
-    ))
-    model = model.replace(dnode=model.dnode.renormalize())
-    model = model.replace(leaves=model.leaves.clamp())
     BATCH_SIZE = 3000
     def get_batch(mnist, key):
-        perm = random.permutation(key, len(mnist.image))
+        perm = random.permutation(key, len(mnist.x))
         indices = perm[:BATCH_SIZE]
         return tree_map(operator.itemgetter(indices), mnist)
-    for i in range(50):
+    for i in range(100):
         key = PRNGKey(i)
         batch = get_batch(mnist, key)
         loss, grad = loss_and_grad(model, batch, key)
-        #ent, egrad = entropy_loss_grad(model, key)
-        #lngrad = gradlognormalizer(model)
         print(f'iter {i}, pixel loss {(loss)/ pixel_count:.4f}, {model.dnode.cluster_sizes()}')
-        #model = tree_map(lambda p, g: p - 1e-1 * g, model, grad)
-        leaves = model.leaves
-        scale = grad.leaves.probe
-        leaves = tree_map(lambda p, g, f: p - 1e-1 * (g) / (1e-32 + jnp.abs(scale*f)), leaves, grad.leaves, leaves.fisher)
-        leaves = leaves.clamp()
-        model = model.replace(leaves=leaves)
-        
-        #dnode = model.dnode
-        #dnode = tree_map(lambda p, g, lng: p - 3e-2 * g, dnode, grad.dnode, lngrad.dnode)
-        #dnode = dnode.renormalize()
-        #model = model.replace(dnode=dnode)
-        model = model.dnode_observe_x(batch.image)
-
-        prior = model.prior
-        prior = tree_map(lambda p, g, f: p - 1e-1 * (g) / (1e-8 + jnp.abs(f)), prior, grad.prior, prior.fisher)
-        prior = prior.clamp()
-        model = model.replace(prior=prior)
+        model = model.replace(prior=model.prior.newton_step(grad.prior, lr=3e-1))
+        if i > 10:
+            model = model.replace(leaves=model.leaves.newton_step(grad.leaves, lr=1e-1))
+        model = model.dnode_observe_x(batch.x)
     print(model.dnode.cluster_compositions())
     return model
 
 def show(model, mnist):
-    sample = model.sample(PRNGKey(0))
-    sample = einshape("...(ss)->...ss", sample, s=SIZE)
-    print(sample.shape)
-    print(sample)
     rowsize = 8
     samples = jax.vmap(model.sample)(random.split(PRNGKey(0), rowsize**2))
-    samples = einshape("(rr)(ss)->(rr)ss1", samples, s=SIZE, r=rowsize)
-    print(samples.shape)
+    samples = jax.vmap(as_image)(samples.mean)
     vae_utils.save_image(samples, "results/beta/samples.png", nrow=rowsize)
+
     total_leaves = tree_map(jnp.add, model.leaves, model.prior)
-    leaf_samples = jax.vmap(total_leaves.sample)(random.split(PRNGKey(0), rowsize))
-    print(leaf_samples.shape)
-    leaf_samples = einshape("rcz->crz", leaf_samples, r=rowsize)
-    leaf_samples = einshape("cr(ss)->(cr)ss1", leaf_samples, s=SIZE, r=rowsize)
+    leaf_samples = jax.vmap(total_leaves.sample, out_axes=1)(random.split(PRNGKey(0), rowsize))
+    leaf_samples = jax.vmap(as_image)(einshape("cr...->(cr)...", leaf_samples))
     print(leaf_samples.shape)
     vae_utils.save_image(leaf_samples, "results/beta/leaves_sample.png", nrow=rowsize)
 
     probs = model.dnode.marginal_probabilities()
     order = jnp.argsort(probs, descending=True)
     leaves_mean = model.leaves.mean[order] # C x N
-    leaves_mean = einshape("c(ss)->css1", leaves_mean, s=SIZE)
-    print(jnp.max(model.leaves.precision))
-    print(jnp.min(model.leaves.precision))
-    print(jnp.mean(model.leaves.precision))
-    leaves_prec = jnp.log1p(model.leaves.precision[order]) / 2.
-    leaves_prec = einshape("c(ss)->css1", leaves_prec, s=SIZE)
+    leaves_prec = model.leaves.precision[order] # C x N
+    leaves_mean = jax.vmap(as_image)(leaves_mean)
+    leaves_prec = jax.vmap(as_image)(jnp.log1p(leaves_prec) / 2.)
     together = jnp.concatenate([leaves_mean, leaves_prec], axis=0)
     vae_utils.save_image(together, "results/beta/leaves.png", nrow=len(together)//2)
 
 
-CLASSES = jnp.arange(10)
-SIZE = 24
+CLASSES = jnp.arange(5)
+SIZE = 28
+PIXEL_SPACE = True
+
+if not PIXEL_SPACE:
+    _MODEL, _PARAMS = load_vae_model()
+def as_image(sample):
+    if not PIXEL_SPACE:
+        sample = vae_decode(_MODEL, _PARAMS, sample)
+    return einshape("...(ss)->...ss1", sample, s=SIZE)
+
 def main():
     jnp.set_printoptions(precision=2, suppress=True)
-    mnist = load_mnist(classes=CLASSES, height=SIZE, width=SIZE)
-    print(f"max pixel: {jnp.max(mnist.image)}, min pixel: {jnp.min(mnist.image)}")
+    if PIXEL_SPACE:
+        mnist = load_mnist(classes=CLASSES, height=SIZE, width=SIZE)
+        N = SIZE * SIZE
+    else:
+        mnist = load_encoded_mnist(classes=CLASSES)
+        N = mnist.x.shape[-1]
+    print(f"max pixel: {jnp.max(mnist.x)}, min pixel: {jnp.min(mnist.x)}")
     print(tree_map(jnp.shape, mnist))
 
-    D = 2
+    D = 3
     C = 24
-    N = SIZE * SIZE
 
     dnode = DetNode.create(D=D, C=C, key=PRNGKey(0))
     leaftype = BetaLeaf
     #leaftype = GaussLeaf
     model = BetaModel.create_with_dnode(dnode, N=N, key=PRNGKey(1), leaftype=leaftype)
-    #model = BetaLeaf.init(key=PRNGKey(2), shape=(N,))
-    #show(model, mnist)
     model = train(model, mnist)
     show(model, mnist)
 
