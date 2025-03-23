@@ -487,8 +487,8 @@ class BetaLeaf(Leaf):
     @classmethod
     def init(cls, key, shape=()):
         key1, key2 = jax.random.split(key)
-        alpha = jax.random.exponential(key1, shape) / 10.
-        beta = jax.random.exponential(key2, shape) / 10.
+        alpha = jax.random.exponential(key1, shape) / 1e1
+        beta = jax.random.exponential(key2, shape) / 1e1
         return cls.default(shape=shape).replace(alpha=alpha, beta=beta)
 
     @classmethod
@@ -532,6 +532,9 @@ class BetaLeaf(Leaf):
     def partition(self) -> Array:
         return betaln(self.alpha + 1., self.beta + 1.)
 
+    def _semi_partition(self) -> Array:
+        return gammaln(self.alpha + 1.) + gammaln(self.beta + 1.)
+
     def _log_prob(self, lnx, ln1mx) -> Array:
         return self.alpha * lnx + self.beta * ln1mx
 
@@ -560,7 +563,7 @@ class GaussLeaf(Leaf):
     def init(cls, key, shape=()):
         key1, key2 = jax.random.split(key)
         location = jax.random.normal(key1, shape)
-        precision = jax.random.exponential(key2, shape)
+        precision = jax.random.exponential(key2, shape) / 1e0
         return cls(location=location, precision=precision, probe=jnp.zeros(shape))
 
     @classmethod
@@ -583,6 +586,9 @@ class GaussLeaf(Leaf):
 
     def partition(self) -> Array:
         return -0.5 * jnp.log(jnp.pi * self.precision) + 0.25 * self.location**2 / (self.precision + 1e-3)
+
+    def _semi_partition(self) -> Array:
+        return -0.5 * jnp.log(jnp.pi * self.precision)
 
     def _log_prob(self, x: Array, xsq: Array, prior: "GaussLeaf"=None) -> Array:
         return self.location * x - self.precision * xsq
@@ -645,6 +651,44 @@ class BetaModel:
         leaf_probs = jax.vmap(jax.grad(self.dnode.log_prob_unnorm))(leaves_log_prob)
         dnode = self.dnode.observe(leaf_probs, float_obs=True)
         return self.replace(dnode=dnode)
+
+    def cross_prob_matrix(self) -> Array:
+        return self.cond_cross_prob_matrix(jnp.zeros((self.dnode.C,)))
+
+    def cond_cross_prob_matrix(self, cond_probs: Array) -> Array:
+        C = self.dnode.C
+        lprob_fn = self.dnode.log_prob_unnorm
+        #lprob_fn = logsumexp
+        probs = jax.grad(lprob_fn)(cond_probs)
+        cross_probs = jax.hessian(lprob_fn)(cond_probs)
+        outer_probs = jnp.einsum("...i,...j->...ij", probs, probs)
+        return outer_probs + cross_probs - jnp.diag(probs)
+
+    def cross_prob_matrix_at_x(self, x: Array) -> Array:
+        leaves_log_prob = self.leaf_log_probs(*self.leaves.sufficient_statistics(x))
+        leaves_log_prob = leaves_log_prob - jnp.max(leaves_log_prob, axis=-1, keepdims=True)
+        return self.cond_cross_prob_matrix(leaves_log_prob)
+
+    def interference_matrix(self) -> Array:
+        total_leaves = tree_map(jnp.add, self.leaves, self.prior)
+        cross_totals = tree_map(lambda a, b, p: a[:,None,:] + b[None,:,:] + p, self.leaves, self.leaves, self.prior)
+        individual = (self.prior._semi_partition() - total_leaves._semi_partition()).sum(axis=-1)
+        cross = (self.prior._semi_partition() - cross_totals._semi_partition()).sum(axis=-1)
+        diff = individual[None, :] + individual[:, None] - cross
+        return diff
+
+    def _intractability(self, cpm):
+        cpm.at[jnp.diag_indices(cpm.shape[-1])].set(0.0)
+        cpm = jax.lax.stop_gradient(cpm)
+        return jnp.sum(self.interference_matrix() * cpm)
+
+    def intractability(self):
+        return self._intractability(self.cross_prob_matrix())
+
+    def intractability_at_x(self, x: Array):
+        return self._intractability(self.cross_prob_matrix_at_x(x))
+
+
 
 
 

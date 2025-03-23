@@ -17,7 +17,11 @@ import vae.utils as vae_utils
 @jax.jit
 def loss_and_grad(model, mnist, key):
     lnprobs = jax.vmap(model.log_prob_x)(mnist.x)
-    return -jnp.mean(lnprobs)
+    local_intractabilities = jax.vmap(model.intractability_at_x)(mnist.x)
+    intractability = 1e-0 * local_intractabilities.mean()
+    #global_intractability = model.intractability()
+    #intractability = 1e-0 * global_intractability
+    return -jnp.mean(lnprobs) + intractability
 
 def train(model, mnist):
     pixel_count = mnist.x.shape[-1]
@@ -32,6 +36,7 @@ def train(model, mnist):
         batch = get_batch(mnist, key)
         loss, grad = loss_and_grad(model, batch, key)
         print(f'iter {i}, pixel loss {(loss)/ pixel_count:.4f}, {model.dnode.cluster_sizes()}')
+        print(f"intractability: {model.intractability()}")
         model = model.replace(prior=model.prior.newton_step(grad.prior, lr=3e-1))
         if i > 10:
             model = model.replace(leaves=model.leaves.newton_step(grad.leaves, lr=1e-1))
@@ -53,6 +58,7 @@ def show(model, mnist):
 
     probs = model.dnode.marginal_probabilities()
     order = jnp.argsort(probs, descending=True)
+    order = jnp.arange(len(probs))
     leaves_mean = model.leaves.mean[order] # C x N
     leaves_prec = model.leaves.precision[order] # C x N
     leaves_mean = jax.vmap(as_image)(leaves_mean)
@@ -83,13 +89,20 @@ def main():
     print(f"max pixel: {jnp.max(mnist.x)}, min pixel: {jnp.min(mnist.x)}")
     print(tree_map(jnp.shape, mnist))
 
-    D = 3
+    D = 2
     C = 24
 
     dnode = DetNode.create(D=D, C=C, key=PRNGKey(0))
     leaftype = BetaLeaf
     #leaftype = GaussLeaf
     model = BetaModel.create_with_dnode(dnode, N=N, key=PRNGKey(1), leaftype=leaftype)
+    #model = model.replace(dnode=model.dnode.orthogonalize())
+
+    cpm = model.cross_prob_matrix()
+    print(cpm)
+    print(model.interference_matrix())
+    print(model.intractability())
+
     model = train(model, mnist)
     show(model, mnist)
 
