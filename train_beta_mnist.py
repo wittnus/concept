@@ -17,10 +17,17 @@ import vae.utils as vae_utils
 @jax.jit
 def loss_and_grad(model, mnist, key):
     lnprobs = jax.vmap(model.log_prob_x)(mnist.x)
+    if hasattr(mnist, 'precision'):
+        precision = mnist.precision
+    else:
+        precision = 32.
+    dist = model.prior.with_mean_and_precision(mnist.x, precision)
+    kl_div = jax.vmap(model.kl_divergence)(dist)
     local_intractabilities = jax.vmap(model.intractability_at_x)(mnist.x)
     intractability = 1e-0 * local_intractabilities.mean()
     #global_intractability = model.intractability()
     #intractability = 1e-0 * global_intractability
+    return kl_div.mean() #+ intractability
     return -jnp.mean(lnprobs) + intractability
 
 def train(model, mnist):
@@ -40,7 +47,7 @@ def train(model, mnist):
         model = model.replace(prior=model.prior.newton_step(grad.prior, lr=3e-1))
         if i > 10:
             model = model.replace(leaves=model.leaves.newton_step(grad.leaves, lr=1e-1))
-        model = model.dnode_observe_x(batch.x)
+        model = model.dnode_observe_x(batch.x, key)
     print(model.dnode.cluster_compositions())
     return model
 
@@ -50,9 +57,17 @@ def show(model, mnist):
     samples = jax.vmap(as_image)(samples.mean)
     vae_utils.save_image(samples, "results/beta/samples.png", nrow=rowsize)
 
-    total_leaves = tree_map(jnp.add, model.leaves, model.prior)
-    leaf_samples = jax.vmap(total_leaves.sample, out_axes=1)(random.split(PRNGKey(0), rowsize))
-    leaf_samples = jax.vmap(as_image)(einshape("cr...->(cr)...", leaf_samples))
+    leaf_sampless = []
+    for i in range(len(model.leaves.mean)):
+        leaf_samples = jax.vmap(partial(model.leaf_sample, index=i))(random.split(PRNGKey(0), rowsize))
+        leaf_samples = leaf_samples.mean
+        #leaf_samples = leaf_samples.sample(PRNGKey(1))
+        leaf_samples = jax.vmap(as_image)(leaf_samples)
+        leaf_sampless.append(leaf_samples)
+    leaf_samples = jnp.concatenate(leaf_sampless, axis=0)
+    #total_leaves = tree_map(jnp.add, model.leaves, model.prior)
+    #leaf_samples = jax.vmap(total_leaves.sample, out_axes=1)(random.split(PRNGKey(0), rowsize))
+    #leaf_samples = jax.vmap(as_image)(einshape("cr...->(cr)...", leaf_samples))
     print(leaf_samples.shape)
     vae_utils.save_image(leaf_samples, "results/beta/leaves_sample.png", nrow=rowsize)
 
@@ -90,7 +105,7 @@ def main():
     print(tree_map(jnp.shape, mnist))
 
     D = 2
-    C = 24
+    C = 12
 
     dnode = DetNode.create(D=D, C=C, key=PRNGKey(0))
     leaftype = BetaLeaf

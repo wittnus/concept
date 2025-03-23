@@ -128,17 +128,19 @@ class DetNode:
 
     @jax.jit
     def sample(
-        self, key: PRNGKey
+        self, key: PRNGKey, cond_lprobs: Array = None
     ) -> Tuple[Array, Array]:  # PRNGKey -> Array[bool], float
         D = self.D
         C = self.C
         result = jnp.zeros((C,), dtype=jnp.bool)
-        cond_lprobs = jnp.zeros((C,))
+        if cond_lprobs is None:
+            cond_lprobs = jnp.zeros((C,))
         #final_prob = jnp.array(1.0)
         final_lprob = jnp.array(0.0)
         for subkey in jax.random.split(key, D):
             choice, lprob = self.sample_one_cond(result, cond_lprobs, subkey)
             result = result.at[choice].set(True)
+            cond_lprobs = cond_lprobs.at[choice].set(-jnp.inf)
             #final_prob *= prob
             final_lprob += lprob
         return result, final_lprob
@@ -440,6 +442,11 @@ class Leaf:
     def sufficient_statistics(cls, x: Array) -> Tuple[Array, Array]:
         raise NotImplementedError
 
+    @property
+    def expectation(self) -> Tuple[Array, Array]:
+        """expectation of sufficient statistics"""
+        raise NotImplementedError
+
     def clamp(self, minval: float = 0.0, maxval: float = 1.0) -> "Leaf":
         return self
 
@@ -470,6 +477,9 @@ class Leaf:
             total = tree_map(jnp.add, self, prior)
             return self._log_prob(*t) - total.partition() + prior.partition() + probe
 
+    def cross_negentropy(self, other: "Leaf", prior: "Leaf"=None) -> Array:
+        return self.log_prob(*other.expectation, prior=prior)
+
     def sample(self, key: PRNGKey) -> Array:
         raise NotImplementedError
 
@@ -492,6 +502,12 @@ class BetaLeaf(Leaf):
         return cls.default(shape=shape).replace(alpha=alpha, beta=beta)
 
     @classmethod
+    def with_mean_and_precision(cls, mean: Array, precision: Array) -> "BetaLeaf":
+        alpha = mean * precision
+        beta = (1. - mean) * precision
+        return cls.default(shape=mean.shape).replace(alpha=alpha, beta=beta)
+
+    @classmethod
     def sufficient_statistics(cls, x: Array) -> Tuple[Array, Array]:
         x = jnp.clip(x, 1e-3, 1. - 1e-3)
         return jnp.log(x), jnp.log1p(-x)
@@ -502,11 +518,12 @@ class BetaLeaf(Leaf):
         return (self.alpha + 1.) / (self.alpha + self.beta + 2.)
 
     @property
-    def expectation(self) -> "BetaLeaf":
+    def expectation(self) -> Tuple[Array, Array]:
         """expectation of sufficient statistics"""
         exp_lnx = digamma(self.alpha + 1.) - digamma(self.alpha + self.beta + 2.)
         exp_ln1mx = digamma(self.beta + 1.) - digamma(self.alpha + self.beta + 2.)
-        return BetaLeaf(alpha=exp_lnx, beta=exp_ln1mx, probe=jnp.zeros_like(self.probe))
+        return exp_lnx, exp_ln1mx
+        #return BetaLeaf(alpha=exp_lnx, beta=exp_ln1mx, probe=jnp.zeros_like(self.probe))
 
     @property
     def precision(self) -> Array:
@@ -563,8 +580,15 @@ class GaussLeaf(Leaf):
     def init(cls, key, shape=()):
         key1, key2 = jax.random.split(key)
         location = jax.random.normal(key1, shape)
+        #location = jax.random.uniform(key1, shape)
         precision = jax.random.exponential(key2, shape) / 1e0
         return cls(location=location, precision=precision, probe=jnp.zeros(shape))
+
+    @classmethod
+    def with_mean_and_precision(cls, mean: Array, precision: Array) -> "GaussLeaf":
+        location = precision * mean
+        precision = jnp.broadcast_to(precision / 2., mean.shape)
+        return cls(location=location, precision=precision, probe=jnp.zeros_like(mean))
 
     @classmethod
     def sufficient_statistics(cls, x: Array) -> Tuple[Array, Array]:
@@ -572,12 +596,16 @@ class GaussLeaf(Leaf):
 
     @property
     def mean(self) -> Array:
-        return self.location / (self.precision + 1e-3)
+        return self.location / (2. * self.precision + 1e-3)
+
+    @property
+    def expectation(self) -> Tuple[Array, Array]:
+        return self.mean, self.mean**2 + 1. / (2. * self.precision + 1e-3)
 
     @property
     def fisher(self) -> "GaussLeaf":
-        f = 1 / (self.precision + 1e-3)
-        return GaussLeaf(location=f, precision=f, probe=jnp.ones_like(self.probe))
+        f = 1 / (2. * self.precision + 1e-3)
+        return GaussLeaf(location=f, precision=f**2, probe=jnp.ones_like(self.probe))
 
     def clamp(self, minval: float = -1e1, maxval: float = 1e4) -> "GaussLeaf":
         location = jnp.clip(self.location, minval, maxval)
@@ -585,10 +613,10 @@ class GaussLeaf(Leaf):
         return GaussLeaf(location=location, precision=precision, probe=jnp.zeros_like(self.probe))
 
     def partition(self) -> Array:
-        return -0.5 * jnp.log(jnp.pi * self.precision) + 0.25 * self.location**2 / (self.precision + 1e-3)
+        return -0.5 * jnp.log(self.precision / jnp.pi) + 0.25 * self.location**2 / (self.precision + 1e-3)
 
     def _semi_partition(self) -> Array:
-        return -0.5 * jnp.log(jnp.pi * self.precision)
+        return -0.5 * jnp.log(self.precision / jnp.pi)
 
     def _log_prob(self, x: Array, xsq: Array, prior: "GaussLeaf"=None) -> Array:
         return self.location * x - self.precision * xsq
@@ -602,7 +630,7 @@ class GaussLeaf(Leaf):
 
     def sample(self, key: PRNGKey) -> Array:
         white = jax.random.normal(key, shape=self.location.shape)
-        return self.mean + white / jnp.sqrt(self.precision + 1e-3)
+        return self.mean + white / jnp.sqrt(self.precision * 2. + 1e-3)
 
 
 
@@ -637,19 +665,35 @@ class BetaModel:
     def log_prob_x(self, x: Array) -> Array:
         return self.log_prob(*self.leaves.sufficient_statistics(x))
 
-    def sample(self, key, dist=False) -> Array:
+    def cross_entropy(self, dist: "Leaf") -> Array:
+        return -self.log_prob(*dist.expectation)
+
+    def kl_divergence(self, dist: "Leaf") -> Array:
+        return -self.log_prob(*dist.expectation) + jnp.sum(dist.log_prob(*dist.expectation))
+
+    def sample(self, key) -> Array:
         key1, key2 = jax.random.split(key)
         choices, _ = self.dnode.sample(key1)
         total_chosen = tree_map(lambda l: jnp.sum(l, axis=-2, where=choices[..., None]), self.leaves)
         total_chosen = tree_map(jnp.add, total_chosen, self.prior)
         return total_chosen
 
+    def leaf_sample(self, key, index) -> Array:
+        key1, key2 = jax.random.split(key)
+        leaf_lprobs = jnp.zeros((self.dnode.C,)).at[index].set(jnp.inf)
+        choices, _ = self.dnode.sample(key1, cond_lprobs=leaf_lprobs)
+        total_chosen = tree_map(lambda l: jnp.sum(l, axis=-2, where=choices[..., None]), self.leaves)
+        total_chosen = tree_map(jnp.add, total_chosen, self.prior)
+        return total_chosen
+
     @jax.jit
-    def dnode_observe_x(self, x: Array) -> "BetaModel":
+    def dnode_observe_x(self, x: Array, key: PRNGKey) -> "BetaModel":
         leaves_log_prob = self.leaf_log_probs(*self.leaves.sufficient_statistics(x))
         leaves_log_prob = leaves_log_prob - jnp.max(leaves_log_prob, axis=-1, keepdims=True)
-        leaf_probs = jax.vmap(jax.grad(self.dnode.log_prob_unnorm))(leaves_log_prob)
-        dnode = self.dnode.observe(leaf_probs, float_obs=True)
+        leaf_choices = jax.vmap(self.dnode.sample)(random.split(key, x.shape[0]), cond_lprobs=leaves_log_prob)[0]
+        #leaf_probs = jax.vmap(jax.grad(self.dnode.log_prob_unnorm))(leaves_log_prob)
+        #dnode = self.dnode.observe(leaf_probs, float_obs=True)
+        dnode = self.dnode.observe(leaf_choices, float_obs=False)
         return self.replace(dnode=dnode)
 
     def cross_prob_matrix(self) -> Array:

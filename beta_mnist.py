@@ -37,13 +37,16 @@ def vae_decode(model, params, z):
 class EncodedDatum:
     x: Array
     label: Array
+    precision: Array
 
 def load_encoded_mnist(classes: Array=jnp.arange(10)):
     encoded_data = jnp.load("vae/results/encoded_ds.npz")
     data = encoded_data["encoding"]
     labels = encoded_data["digit"]
+    logvar = encoded_data["logvar"]
+    precision = jnp.exp(-logvar)
     keep = jnp.isin(labels, classes)
-    return EncodedDatum(x=data[keep], label=labels[keep])
+    return EncodedDatum(x=data[keep], label=labels[keep], precision=precision[keep])
 
 
 def fuzz_pixels(key, image):
